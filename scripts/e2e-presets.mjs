@@ -1,0 +1,23 @@
+﻿import { createRequire } from "node:module";
+const r = createRequire("C:/nvm4w/nodejs/node_modules/");
+const { chromium } = r("playwright");
+const b = await chromium.connectOverCDP("http://127.0.0.1:9222");
+const p = b.contexts()[0].pages()[0];
+await p.keyboard.press("Escape");
+await p.waitForTimeout(500);
+await p.getByRole("button", { name: "Pengaturan (Ctrl+,)" }).click();
+await p.waitForTimeout(600);
+const field = (label) => p.locator(".modal label", { hasText: label }).locator("input").first();
+const before = { url: await field("Base URL").inputValue(), model: await field("Model").inputValue() };
+await p.locator(".chip", { hasText: "DeepSeek" }).click();
+await p.waitForTimeout(300);
+const after = { url: await field("Base URL").inputValue(), model: await field("Model").inputValue() };
+await p.screenshot({ path: "shots/settings-presets.png" });
+// leave the app unconfigured again
+await field("Base URL").fill("");
+await field("Model").fill("");
+await p.getByRole("button", { name: "Simpan", exact: true }).click();
+await p.waitForTimeout(700);
+const pill = await p.locator(".model-pill, .pill").first().innerText().catch(() => "");
+console.log(JSON.stringify({ before, after, pill }));
+await b.close();

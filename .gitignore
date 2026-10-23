@@ -1,0 +1,25 @@
+# dependencies
+node_modules
+
+# builds
+dist
+dist-ssr
+src-tauri/target
+src-tauri/gen
+
+# local tooling output
+*.log
+scripts/_scratch
+
+# the app's own data lives outside the repo (appdata), but keep stray dbs out
+*.db
+*.db-wal
+*.db-shm
+
+# personal material: saved references and test screenshots
+referensi/
+shots/
+
+.DS_Store
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,8 @@
+# one normalisation for every machine: LF in the repo, native on checkout
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.woff2 binary

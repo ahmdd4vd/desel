@@ -1,0 +1,40 @@
+[package]
+name = "desel"
+version = "0.2.0"
+description = "Desel — AI carousel studio with an agent that writes slides as code"
+authors = ["Desel"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "desel_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt", "net", "io-util"] }
+futures-util = "0.3"
+base64 = "0.22"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+scraper = "0.29"
+regex = "1"
+urlencoding = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

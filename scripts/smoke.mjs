@@ -1,0 +1,18 @@
+﻿import { createRequire } from "node:module";
+const r = createRequire("C:/nvm4w/nodejs/node_modules/");
+const { chromium } = r("playwright");
+const b = await chromium.launch({ executablePath: "C:\\Users\\david\\AppData\\Local\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe", headless: true });
+const p = await b.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2 });
+const errors = [];
+p.on("pageerror", (e) => errors.push(String(e)));
+p.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
+await p.goto("http://127.0.0.1:1420/", { waitUntil: "networkidle" });
+await p.waitForTimeout(1200);
+const shell = await p.locator(".topbar").count();
+const left = await p.locator(".chat-panel").count();
+const stage = await p.locator(".stage").count();
+const rail = await p.locator(".rail").count();
+const refs = await p.locator(".refs").count();
+await p.screenshot({ path: "shots/final-empty-2.png" });
+console.log(JSON.stringify({ shell, left, stage, rail, refs, errors }));
+await b.close();
