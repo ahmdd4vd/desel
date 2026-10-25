@@ -23,3 +23,29 @@ shots/
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
+# private implementation checkpoints and captured paid-test artifacts
+docs/CHECKPOINT-*.md
+docs/QUALIFICATION-*.md
+tests/fixtures/
+tests/browser/
+tests/ui-bridge-audit.rs.txt
+src-tauri/src/benchmark_bridge.rs
+
+# local Python caches and credentials
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.credentials
+*.registration
+*.dpapi
+
+# release resources fetched and hash-verified during developer/build preparation
+src-tauri/binaries/*
+/scripts/test-provider-ui.mjs
+/scripts/test-provider-store-ui.mjs
+/scripts/test-render-review-ui.mjs
+/scripts/test-render-review.mjs
+/scripts/test-review-regression-ui.mjs
+/scripts/test-geometry.mjs
+/scripts/test-layout-candidate.mjs

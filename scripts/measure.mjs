@@ -10,7 +10,7 @@ const require = createRequire("C:/nvm4w/nodejs/node_modules/");
 const { chromium } = require("playwright");
 
 const CHROME =
-  "C:/Users/david/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe";
+  (process.env.CHROME_BIN || "chromium");
 const URL = process.argv[2] ?? "http://127.0.0.1:1420";
 mkdirSync("shots", { recursive: true });
 

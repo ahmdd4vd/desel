@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 const globalRequire = createRequire("C:/nvm4w/nodejs/node_modules/");
 const { chromium } = globalRequire("playwright");
 
-const EXE = "C:\\Users\\david\\AppData\\Local\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe";
+const EXE = (process.env.CHROME_BIN || "chromium");
 
 const seedSlides = [
   `<style>

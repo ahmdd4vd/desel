@@ -1,0 +1,26 @@
+import path from'node:path';import os from'node:os';import fs from'node:fs';const out=process.env.DESEL_QA_OUTPUT||path.join(os.tmpdir(),'desel-ui-regressions');fs.mkdirSync(out,{recursive:true});import{spawn}from'node:child_process';import puppeteer from'puppeteer-core';const root=process.cwd();const vite=spawn(process.execPath,[path.join(root,'node_modules/vite/bin/vite.js'),'--host','127.0.0.1','--port','1422'],{cwd:root,stdio:'ignore'});let b;try{await new Promise(r=>setTimeout(r,1200));b=await puppeteer.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',headless:true,args:['--no-sandbox']});const p=await b.newPage();await p.goto('http://127.0.0.1:1422/',{waitUntil:'networkidle0'});console.log(await p.evaluate(async()=>{const{useStudio}=await import('/src/state/studio.ts');const st=()=>useStudio.getState();const wait=ms=>new Promise(r=>setTimeout(r,ms));
+st().addSlide();st().updateSlide(st().selectedSlideId,{html:'<body>Toast fixture v1</body>'});await st().saveDeck();await wait(80);
+if(st().toast?.kind!=='ok')throw Error('success toast missing after first save');
+st().updateSlide(st().selectedSlideId,{html:'<body>Toast fixture v2</body>'});
+const set=Storage.prototype.setItem;let blocked=true;Storage.prototype.setItem=function(k,v){if(k==='desel.v2.decks'&&blocked)throw Error('Fixture save refused');return set.call(this,k,v)};
+await st().saveDeck().catch(()=>undefined);Storage.prototype.setItem=set;await wait(80);
+if(st().toast?.kind==='ok')throw Error('stale success toast survived failed save');
+if(st().saveState!=='error')throw Error('save failure state missing');
+let banner=document.querySelector('.save-error-banner');if(!banner)throw Error('error banner missing after failed save');
+if(banner.textContent.includes('Error: Error')||/^Error:/.test(st().saveError))throw Error('duplicate Error prefix still shown');
+const origHistory=st().refreshHistory,origDecks=st().refreshDecks;
+useStudio.setState({refreshHistory:async()=>{await wait(300)},refreshDecks:async()=>{await wait(300)}});
+st().updateSlide(st().selectedSlideId,{html:'<body>Toast fixture v3</body>'});
+const slowSuccess=st().saveDeck().catch(()=>undefined);
+await wait(60);
+st().updateSlide(st().selectedSlideId,{html:'<body>Toast fixture v4</body>'});
+blocked=true;Storage.prototype.setItem=function(k,v){if(k==='desel.v2.decks'&&blocked)throw Error('Fixture newer save refused');return set.call(this,k,v)};
+await st().saveDeck().catch(()=>undefined);Storage.prototype.setItem=set;blocked=false;
+await slowSuccess;await wait(400);
+if(st().toast?.kind==='ok')throw Error('delayed success toast appeared after newer failure');
+if(st().saveState!=='error')throw Error('newer failure state overwritten');
+useStudio.setState({refreshHistory:origHistory,refreshDecks:origDecks});
+await st().saveDeck().catch(()=>undefined);await wait(120);
+if(st().saveState!=='saved')throw Error('genuine retry did not save');
+if(st().toast?.kind!=='ok')throw Error('genuine later success toast suppressed');
+return{staleSuccessClearedOnFailure:true,delayedSuccessAfterNewerFailureSuppressed:true,genuineRetrySuccessShown:true,noDuplicateErrorPrefix:true}}));}finally{if(b)await b.close();vite.kill();await new Promise(r=>vite.once('exit',r))}

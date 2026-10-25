@@ -11,6 +11,14 @@ use crate::model::*;
 
 pub struct AppState {
     pub db: Db,
+    /// Geometry findings measured by the front-end's rendered preview, keyed by
+    /// deck. The string linter cannot see these; the agent needs them to
+    /// self-correct overlaps the user can see in the lint panel.
+    pub geometry: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Per-deck cancel flags for the running agent, set by `cancel_agent`.
+    pub cancel: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -18,8 +26,8 @@ pub struct AppState {
 /* -------------------------------------------------------------------------- */
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
-    state.db.get_settings()
+pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings,String> {
+    state.db.get_settings_checked()
 }
 
 #[tauri::command]
@@ -38,8 +46,15 @@ pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, Stri
 }
 
 #[tauri::command]
-pub async fn test_connection(state: State<'_, AppState>) -> Result<Value, String> {
-    let settings = state.db.get_settings();
+pub async fn discover_models(app:tauri::AppHandle, mut settings: AppSettings) -> Result<Vec<crate::capabilities::ModelCapability>,String> {
+    crate::provider_runtime::resolve(&app,&mut settings).await?;
+    agent::discover_capabilities(&settings).await
+}
+
+#[tauri::command]
+pub async fn test_connection(app:tauri::AppHandle,state: State<'_, AppState>, settings: Option<AppSettings>) -> Result<Value, String> {
+    let mut settings = settings.unwrap_or_else(||state.db.get_settings());
+    crate::provider_runtime::resolve(&app,&mut settings).await?;
     agent::test_connection(&settings).await
 }
 
@@ -48,13 +63,13 @@ pub async fn test_connection(state: State<'_, AppState>) -> Result<Value, String
 /* -------------------------------------------------------------------------- */
 
 #[tauri::command]
-pub fn list_decks(state: State<'_, AppState>) -> Vec<DeckSummary> {
-    state.db.list_decks()
+pub fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>,String> {
+    state.db.list_decks_checked()
 }
 
 #[tauri::command]
-pub fn get_deck(state: State<'_, AppState>, id: String) -> Option<Deck> {
-    state.db.get_deck(&id)
+pub fn get_deck(state: State<'_, AppState>, id: String) -> Result<Option<Deck>,String> {
+    state.db.get_deck_checked(&id)
 }
 
 #[derive(Deserialize)]
@@ -82,12 +97,13 @@ pub fn create_deck(state: State<'_, AppState>, args: CreateDeckArgs) -> Result<D
             .map(|t| {
                 let mut d = t.deck;
                 d.id = new_id("deck");
+                fresh_template_slide_ids(&mut d);
                 d.from_template_id = Some(tid.clone());
                 d.created_at = now.clone();
                 d.updated_at = now.clone();
                 d
             })
-            .unwrap_or_else(|| blank_deck(&now))
+            .ok_or_else(||"Template tidak ditemukan; proyek tidak dibuat".to_string())?
     } else {
         blank_deck(&now)
     };
@@ -95,7 +111,7 @@ pub fn create_deck(state: State<'_, AppState>, args: CreateDeckArgs) -> Result<D
     if !args.title.trim().is_empty() {
         deck.title = args.title.trim().to_string();
     }
-    if ["4:5", "1:1", "9:16"].contains(&args.aspect.as_str()) {
+    if ["4:5", "1:1", "9:16", "16:9"].contains(&args.aspect.as_str()) {
         deck.aspect = args.aspect.clone();
     }
 
@@ -128,10 +144,11 @@ pub fn save_deck(
     state: State<'_, AppState>,
     deck: Deck,
     thumbnail: Option<String>,
+    expected:Option<Deck>,
 ) -> Result<Deck, String> {
     state
         .db
-        .save_deck(&deck, thumbnail.as_deref())
+        .save_deck_checked(&deck, thumbnail.as_deref(),expected.as_ref())
         .map_err(|e| format!("gagal menyimpan deck: {e}"))?;
     Ok(deck)
 }
@@ -146,20 +163,7 @@ pub fn delete_deck(state: State<'_, AppState>, id: String) -> Result<(), String>
 
 #[tauri::command]
 pub fn duplicate_deck(state: State<'_, AppState>, id: String) -> Result<Deck, String> {
-    let mut deck = state
-        .db
-        .get_deck(&id)
-        .ok_or_else(|| "deck tidak ditemukan".to_string())?;
-    let now = chrono::Utc::now().to_rfc3339();
-    deck.id = new_id("deck");
-    deck.title = format!("{} (copy)", deck.title);
-    deck.created_at = now.clone();
-    deck.updated_at = now.clone();
-    state
-        .db
-        .save_deck(&deck, None)
-        .map_err(|e| format!("gagal menduplikat deck: {e}"))?;
-    Ok(deck)
+    crate::project_file::duplicate(&state.db,&id)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -192,7 +196,7 @@ pub fn append_message(
         role,
         content,
         tool_calls: Vec::new(),
-        tool_call_id: None,
+        tool_call_id: None, reasoning_content: String::new(),
         streaming: false,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -206,13 +210,16 @@ pub fn append_message(
 /// Starts the agent. Returns immediately; progress arrives on `channel`.
 #[tauri::command]
 pub async fn send_to_agent(
+    app:tauri::AppHandle,
     state: State<'_, AppState>,
     deck_id: String,
     text: String,
     channel: Channel<AgentEvent>,
 ) -> Result<(), String> {
-    let settings = state.db.get_settings();
+    let mut settings = state.db.get_settings();
+    crate::provider_runtime::resolve(&app,&mut settings).await?;
 
+    if settings.model.trim().is_empty(){return Err("Pilih model provider di Pengaturan sebelum mengirim pesan.".into())}
     if settings.api_key.trim().is_empty()
         && !matches!(agent::provider_label(&settings.base_url).as_str(), "Local")
     {
@@ -221,6 +228,11 @@ pub async fn send_to_agent(
         );
     }
 
+    if settings.send_references {
+        if let Some(cap)=settings.model_capabilities.iter().find(|c|c.id==settings.model && c.source==settings.base_url){
+            if !cap.input_modalities.is_empty() && !cap.input_modalities.iter().any(|v|v=="image") {return Err("Metadata model ini tidak mendukung input gambar. Matikan pengiriman gambar atau pilih model vision.".into())}
+        }
+    }
     // Persist the user turn first so a reload keeps the transcript intact.
     let user_msg = ChatMessage {
         id: new_id("msg"),
@@ -228,7 +240,7 @@ pub async fn send_to_agent(
         role: "user".into(),
         content: text,
         tool_calls: Vec::new(),
-        tool_call_id: None,
+        tool_call_id: None, reasoning_content: String::new(),
         streaming: false,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -238,9 +250,49 @@ pub async fn send_to_agent(
         .map_err(|e| format!("gagal menyimpan pesan: {e}"))?;
 
     let history = state.db.list_messages(&deck_id);
+    let geometry = state
+        .geometry
+        .lock()
+        .map(|g| g.get(&deck_id).cloned().unwrap_or_default())
+        .unwrap_or_default();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut map) = state.cancel.lock() {
+        map.insert(deck_id.clone(), cancel.clone());
+    }
     let db = &state.db;
-    agent::run_agent(db, &settings, &deck_id, history, channel).await;
+    agent::run_agent(db, &settings, &deck_id, history, geometry, cancel, channel).await;
+    if let Ok(mut map) = state.cancel.lock() {
+        map.remove(&deck_id);
+    }
 
+    Ok(())
+}
+
+/// Stop the agent currently working on a deck. Cooperative: the loop checks
+/// the flag between turns and while streaming, then exits cleanly.
+#[tauri::command]
+pub fn cancel_agent(state: State<'_, AppState>, deck_id: String) -> Result<(), String> {
+    let map = state.cancel.lock().map_err(|e| e.to_string())?;
+    if let Some(flag) = map.get(&deck_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Front-end reports the current geometry findings for a deck (replaces, never
+/// appends; an empty list clears them once the user fixed the slide).
+#[tauri::command]
+pub fn report_geometry_lints(
+    state: State<'_, AppState>,
+    deck_id: String,
+    issues: Vec<String>,
+) -> Result<(), String> {
+    let mut store = state.geometry.lock().map_err(|e| e.to_string())?;
+    if issues.is_empty() {
+        store.remove(&deck_id);
+    } else {
+        store.insert(deck_id, issues);
+    }
     Ok(())
 }
 
@@ -272,7 +324,7 @@ pub fn save_template(
         id: new_id("tpl"),
         name: args.name,
         description: args.description,
-        deck: args.deck,
+        deck: crate::project_file::template_snapshot(&state.db,&args.deck)?,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -406,31 +458,7 @@ pub fn write_export(
     files: Vec<ExportFile>,
     remember_dir: Option<String>,
 ) -> Result<ExportOutcome, String> {
-    use base64::Engine;
-
-    let dir = std::path::PathBuf::from(&directory);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("gagal membuat folder: {e}"))?;
-
-    let mut written = Vec::new();
-    for file in files {
-        let name = std::path::Path::new(&file.name)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .ok_or_else(|| format!("nama file tidak valid: {}", file.name))?;
-
-        let target = dir.join(&name);
-        match file.encoding.as_str() {
-            "utf8" => std::fs::write(&target, file.data.as_bytes())
-                .map_err(|e| format!("gagal menulis {name}: {e}"))?,
-            _ => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(file.data.as_bytes())
-                    .map_err(|e| format!("base64 tidak valid untuk {name}: {e}"))?;
-                std::fs::write(&target, bytes).map_err(|e| format!("gagal menulis {name}: {e}"))?;
-            }
-        }
-        written.push(target.to_string_lossy().to_string());
-    }
+    let outcome=crate::export_files::write_batch(&directory,files)?;
 
     if let Some(remember) = remember_dir.filter(|d| !d.trim().is_empty()) {
         let mut settings = state.db.get_settings();
@@ -438,10 +466,7 @@ pub fn write_export(
         let _ = state.db.save_settings(&settings);
     }
 
-    Ok(ExportOutcome {
-        directory: dir.to_string_lossy().to_string(),
-        files: written,
-    })
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -518,29 +543,15 @@ pub fn restore_revision(state: State<'_, AppState>, id: String) -> Result<Deck, 
         .db
         .get_revision(&id)
         .ok_or_else(|| "versi itu sudah tidak tersimpan".to_string())?;
-    let mut deck = state
+    let deck = state
         .db
         .get_deck(&revision.deck_id)
         .ok_or_else(|| "deck-nya sudah dihapus".to_string())?;
 
-    let mut restored = false;
-    for slide in deck.slides.iter_mut() {
-        if slide.id != revision.slide_id {
-            continue;
-        }
-        slide.html = revision.html.clone();
-        if !revision.title.trim().is_empty() {
-            slide.title = revision.title.clone();
-        }
-        restored = true;
-    }
-    if !restored {
-        return Err("slide itu sudah tidak ada di deck".into());
-    }
+    let index=deck.slides.iter().position(|s|s.id==revision.slide_id).ok_or("slide itu sudah tidak ada di deck")?;
+    let mut candidate=deck.slides[index].clone();candidate.html=revision.html;candidate.title=revision.title;
+    state.db.commit_slide_candidate(&deck,index,&candidate)
 
-    deck.updated_at = chrono::Utc::now().to_rfc3339();
-    state.db.save_deck(&deck, None).map_err(|e| e.to_string())?;
-    Ok(deck)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -584,7 +595,7 @@ fn insert_reference(
     let profile = crate::palette::analyse(&bytes);
     state
         .db
-        .add_asset(&Asset {
+        .add_asset(&Asset {provenance:None,reference_role:String::new(),reference_status:String::new(),
             id: new_id("ref"),
             deck_id: Some(deck_id.to_string()),
             name,
@@ -688,3 +699,36 @@ pub fn delete_reference(state: State<'_, AppState>, id: String) -> Result<(), St
 pub fn reference_data(state: State<'_, AppState>, deck_id: String) -> Vec<Asset> {
     state.db.list_assets(&deck_id)
 }
+
+#[tauri::command]
+pub fn set_reference_intent(state:State<'_,AppState>,deck_id:String,id:String,role:String,status:String)->Result<(),String>{state.db.set_reference_intent(&deck_id,&id,&role,&status)}
+
+/// Revision-bound render receipt. Kept transiently in the existing private asset
+/// mailbox, then consumed/deleted by the active run. Not a user reference.
+#[tauri::command]
+pub fn submit_render_review(state:State<'_,AppState>,deck_id:String,request_id:String,receipt:Value)->Result<(),String>{
+ let asset=Asset{id:new_id("review"),deck_id:Some(deck_id),name:format!("__render_receipt_{request_id}"),mime:"application/json".into(),data:receipt.to_string(),provenance:None,reference_role:String::new(),reference_status:String::new(),profile:None,created_at:chrono::Utc::now().to_rfc3339()};
+ state.db.add_asset(&asset).map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+pub fn deck_history_counts(state:State<'_,AppState>,id:String)->[i64;2]{state.db.deck_history_counts(&id)}
+#[tauri::command]
+pub fn step_deck_history(state:State<'_,AppState>,expected:Deck,direction:String)->Result<Deck,String>{state.db.step_deck_history(&expected,&direction)}
+
+fn fresh_template_slide_ids(deck:&mut Deck){for slide in &mut deck.slides{slide.id=new_id("slide");}}
+#[cfg(test)]mod template_isolation_tests{use super::*;#[test]fn fresh_template_copies_do_not_share_revision_or_pin_ids(){let source:Deck=serde_json::from_value(json!({"id":"template","slides":[{"id":"a","html":"art"},{"id":"b","html":"second"}]})).unwrap();let mut a=source.clone();let mut b=source.clone();fresh_template_slide_ids(&mut a);fresh_template_slide_ids(&mut b);assert!(a.slides.iter().all(|x|b.slides.iter().all(|y|x.id!=y.id)));assert!(a.slides.iter().all(|x|source.slides.iter().all(|y|x.id!=y.id)));assert_eq!(a.slides[0].html,"art");}}
+
+#[tauri::command]
+pub fn set_asset_provenance(state:State<'_,AppState>,deck_id:String,id:String,value:AssetProvenance)->Result<(),String>{state.db.set_asset_provenance(&deck_id,&id,&value)}
+#[tauri::command]
+pub fn list_asset_library(state:State<'_,AppState>)->Vec<Asset>{state.db.library_assets()}
+#[tauri::command]
+pub fn copy_library_asset(state:State<'_,AppState>,deck_id:String,source_deck:String,id:String)->Result<Asset,String>{state.db.copy_library_asset(&deck_id,&source_deck,&id)}
+
+#[tauri::command]
+pub fn asset_by_id(state:State<'_,AppState>,deck_id:String,id:String)->Result<Asset,String>{state.db.asset_by_id(&deck_id,&id)}
+
+#[tauri::command]pub fn list_brands(state:State<'_,AppState>)->Vec<BrandProfile>{state.db.list_brands()}
+#[tauri::command]pub fn save_brand(state:State<'_,AppState>,brand:BrandProfile)->Result<(),String>{state.db.save_brand(&brand)}
+#[tauri::command]pub fn delete_brand(state:State<'_,AppState>,id:String)->Result<(),String>{state.db.delete_brand(&id)}

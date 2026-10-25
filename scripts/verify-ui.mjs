@@ -16,7 +16,7 @@ const { chromium } = require("playwright");
 
 // Use the Chromium that is already on disk instead of downloading a new build.
 const CHROME =
-  "C:/Users/david/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe";
+  (process.env.CHROME_BIN || "chromium");
 
 const OUT = path.resolve("shots");
 mkdirSync(OUT, { recursive: true });

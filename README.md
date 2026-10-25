@@ -8,7 +8,6 @@ The model does not fill slots. It **writes real HTML/CSS/SVG for every slide**,
 can research the web before writing, can ask clarifying questions, and can save
 a finished deck as a reusable design system.
 
-![Workspace](shots/final-board.png)
 
 ## How it works
 
@@ -30,7 +29,7 @@ a finished deck as a reusable design system.
    findings appear on the thumbnail and in the inspector. The agent receives
    the same findings as tool output and fixes them in the same turn.
    Any rewrite keeps the previous wording: the inspector lists recent versions
-   per slide and can restore one, so a bad revision costs nothing. The same
+   per slide and can restore one, so prior wording remains available within the retained history. The same
    applies to edits the agent makes — they are saved through the same path.
    Each finished turn keeps its receipts: a collapsed "n langkah" line under the
    reply lists every tool the agent used, with the exact result it received.
@@ -80,10 +79,19 @@ The prompt tells the model to copy the *grammar* of a reference (type scale,
 density, grid logic, texture treatment, colour discipline), never its text or
 artwork.
 
+Project menu actions include whole-project undo/redo, local recovery copies,
+portable `.desel.json` backup/restore, and a best-effort restart draft prompt.
+Recovery never silently replaces the newer database version. History is bounded;
+portable files intentionally exclude settings/API keys/accounts/chat/history.
+See [project history](docs/PROJECT-HISTORY.md), [portable format](docs/PROJECT-FORMAT.md)
+and [static slide safety](docs/STATIC-SLIDES.md) for limits and test status.
+The canvas/export supports4:5,1:1,9:16 and16:9. Native Windows verification is
+still pending; browser export checks do not prove Windows behavior.
+
 ## Persistence
 
-Everything lives in a local SQLite database, so nothing is lost when the app
-closes:
+Saved project content lives in a local SQLite database. Unsaved changes still
+need a successful save; storage failures are shown persistently:
 
 ```
 %APPDATA%\com.desel.carousel\desel.db
@@ -111,6 +119,7 @@ is why preview and export cannot drift apart.
 
 ```bash
 npm install
+npm run prepare:runtime # developer build: download pinned, hash-verified bundled runtime
 npm run dev      # Tauri desktop app (Rust + Vite)
 npm run build    # production bundle
 ```
@@ -178,7 +187,7 @@ adding a dependency.
 ```bash
 npm run typecheck                                        # frontend types
 cargo test --manifest-path src-tauri/Cargo.toml --lib     # backend
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored   # live search + fetch
+ # Ignored live tests require separate explicit review and may call paid providers.
 npm run build:vite                                       # production bundle
 ```
 
@@ -189,7 +198,7 @@ older installs, reference-image analysis against the real covers in
 worked example inside the system prompt (it has to score zero findings, since it
 is what the model imitates), conversation trimming, the full agent loop against
 a throwaway SSE server, and the agent's write path from an empty deck to a saved
-template. The `--ignored` pair hits the real internet and is skipped by default.
+template. Ignored tests may use real network services or paid providers. Do not run the ignored suite without reviewing its scope and supplying your own test configuration.
 
 ## Limits worth knowing
 
@@ -202,3 +211,25 @@ template. The `--ignored` pair hits the real internet and is skipped by default.
   instead of guessing what was cut.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the reasoning behind these choices.
+
+## Provider checkpoint status
+
+Desel includes the provider runtime in its packaged application. Developers run `npm run prepare:runtime` before direct Cargo commands; Tauri dev/build also runs this step. Official Linux x86_64 and Windows x86_64 binaries are downloaded at build preparation, checked against pinned SHA-256 values and copied into the app resources. End users do not need a separate Magpie installation. ARM/macOS are not bundled by this checkpoint.
+
+Native provider/API/account/plugin management is available in Desel Connect. Plugin code needs explicit trust consent; auto-update is opt-in per supported community plugin. No third-party login plugin is preinstalled.
+
+Official ChatGPT local/open-source account code is in progress. Only secret-free status reads are registered; start/cancel/signout source is not exposed. Responses remains a test-only agent route. Claude Code agent integration is not implemented. This is a development checkpoint, not a release-ready claim. Native Windows launch, real account sign-in/inference, native IPC and automatic new-version arrival remain unverified.
+
+See [provider behavior](docs/PROVIDERS.md) and [account routes](docs/ACCOUNT-ROUTES.md).
+
+Local asset reuse and separate source/credit/rights/alt-text notes are described
+in [ASSET-LIBRARY](docs/ASSET-LIBRARY.md). Export checks exact rendered revisions
+and requires explicit warning acknowledgement: [EXPORT-PREFLIGHT](docs/EXPORT-PREFLIGHT.md).
+Selected HTML objects can be listed and edited without changing flow layouts into
+free-positioned objects: [OBJECT-EDITOR](docs/OBJECT-EDITOR.md).
+
+Local browser regressions (no account/network inference): `npm ci`, then
+`CHROME_PATH=/path/to/chrome npm run test:ui`. Artifacts go to the OS temp
+`desel-ui-regressions` directory; set `DESEL_QA_OUTPUT` to choose another folder.
+The runner uses port1422; keep that port free. `npm run test:editor` checks merge
+and draft contracts without a browser. Native Rust tests remain a separate step.

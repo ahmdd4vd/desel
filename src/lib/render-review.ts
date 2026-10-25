@@ -1,0 +1,8 @@
+import {measureOverlapIssues} from './geometry';
+export function reviewRevision(id:string,aspect:string,html:string):string {let h=2166136261;for(const b of new TextEncoder().encode(`${id}\0${aspect}\0${html}`))h=Math.imul(h^b,16777619)>>>0;return h.toString(16).padStart(8,'0');}
+/** Bound readiness, never treat a missing/stale document as clean. */
+export async function measureRevision(get:()=>{doc:Document;revision:string}|undefined,expected:string,timeout=6000){
+ const deadline=Date.now()+timeout;
+ const ready=async()=>{while(Date.now()<deadline){const current=get();if(current?.revision===expected&&current.doc.body&&current.doc.readyState==='complete'){await current.doc.fonts.ready;await Promise.all(Array.from(current.doc.images).map(image=>image.complete?Promise.resolve():new Promise<void>((resolve,reject)=>{image.addEventListener('load',()=>resolve(),{once:true});image.addEventListener('error',()=>reject(Error('image failed')),{once:true});})));const after=get();if(after?.doc!==current.doc||after.revision!==expected)throw Error('revision changed during render');if(Array.from(current.doc.images).some(i=>!i.naturalWidth))throw Error('image unavailable');return{revision:expected,issues:measureOverlapIssues(current.doc)};}await new Promise(r=>setTimeout(r,40));}throw Error('render revision unavailable');};
+ let timer:ReturnType<typeof setTimeout>|undefined;try{return await Promise.race([ready(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('render readiness timed out')),timeout)})]);}catch(e){return{revision:expected,issues:[],error:String(e)}}finally{clearTimeout(timer)}
+}

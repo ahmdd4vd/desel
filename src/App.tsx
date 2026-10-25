@@ -1,6 +1,27 @@
+import {useDialogFocus} from "./hooks/useDialogFocus";
+import {createAssetCopySaver} from './lib/asset-copy';
+import {inspectExport,exportRevision,type ExportPreflight} from "./lib/export-preflight";
+import pkg from "../package.json";
+import {safeDoc} from "./lib/safe-doc";
+import {ProviderManager} from "./components/ProviderManager";
+import {evaluateLayoutCandidate} from "./lib/layout-candidate";
+import {reviewRevision,measureRevision} from "./lib/render-review";
+import {measureOverlapIssues} from "./lib/geometry";
+import {ProjectReview} from './components/ProjectReview';
+import {AspectChange} from './components/AspectChange';
+import {SlideSearch} from './components/SlideSearch';
+import {SlideOrganizer} from './components/SlideOrganizer';
+import {Presentation} from './components/Presentation';
+import {PaletteEditor} from './components/PaletteEditor';
+import {RevisionCompare} from './components/RevisionCompare';
+import {BrandLibrary} from './components/BrandLibrary';
+import {AssetLibrary} from './components/AssetLibrary';
+import {AssetEditor} from './components/AssetEditor';
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Search,
   ArrowRight,
+  Square,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -12,18 +33,25 @@ import {
   EyeOff,
   FileText,
   FolderPlus,
+  LayoutGrid,
   Layers,
   ImageDown,
   LayoutTemplate,
   Loader2,
   Maximize2,
   MessageSquare,
+  Paperclip,
+  MousePointer2,
+  Type,
+  MoreHorizontal,
   Minus,
   Palette,
+  PanelRight,
   Pin,
   Plus,
   RefreshCw,
   Save,
+  Scan,
   Settings2,
   Sparkles,
   Trash2,
@@ -43,6 +71,7 @@ import {
   type ToolCallRecord,
 } from "./lib/types";
 import Canvas from "./components/Canvas";
+import Board from "./components/Board";
 import { useStudio } from "./state/studio";
 
 type LeftTab = "chat" | "projects" | "templates";
@@ -51,11 +80,15 @@ type RightTab = "design" | "source" | "notes";
 /** One conversation turn: all assistant segments until the next user message. */
 type Turn =
   | { kind: "user"; id: string; text: string }
-  | { kind: "agent"; id: string; text: string; steps: ToolCallRecord[] };
+  | { kind: "agent"; id: string; text: string; reasoning:string; steps: ToolCallRecord[] };
+
+function ChatText({text}:{text:string}) {
+  return <>{text.split(/(`[^`]+`)/g).map((part,i) => part.startsWith("`") && part.endsWith("`") ? <code key={i}>{part.slice(1,-1)}</code> : <span key={i}>{part}</span>)}</>;
+}
 
 function buildTurns(messages: ChatMessage[]): Turn[] {
   const turns: Turn[] = [];
-  let pending: { id: string; parts: string[]; steps: ToolCallRecord[] } | null = null;
+  let pending: { id: string; parts: string[]; reasoning:string[]; steps: ToolCallRecord[] } | null = null;
   const flush = () => {
     if (!pending) return;
     turns.push({
@@ -63,6 +96,7 @@ function buildTurns(messages: ChatMessage[]): Turn[] {
       id: pending.id,
       text: pending.parts.filter(Boolean).join(" ").trim(),
       steps: pending.steps,
+      reasoning:pending.reasoning.join("\n"),
     });
     pending = null;
   };
@@ -72,7 +106,8 @@ function buildTurns(messages: ChatMessage[]): Turn[] {
       turns.push({ kind: "user", id: m.id, text: m.content });
     } else if (m.role === "assistant") {
       // Tool-only responses arrive as separate messages; one bubble per turn.
-      pending ??= { id: m.id, parts: [], steps: [] };
+      pending ??= { id: m.id, parts: [], reasoning:[],steps: [] };
+      if(m.reasoningContent)pending.reasoning.push(m.reasoningContent);
       if (m.content.trim()) pending.parts.push(m.content.trim());
       if (m.toolCalls?.length) pending.steps.push(...m.toolCalls);
     }
@@ -83,12 +118,144 @@ function buildTurns(messages: ChatMessage[]): Turn[] {
 
 /** One-click endpoints, so nobody has to know the base URL by heart. */
 const PROVIDERS = [
+  { label: "Magpie", baseUrl: "http://127.0.0.1:3425/v1", model: "", kind: "magpie-managed" },
   { label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   { label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   { label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
   { label: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
   { label: "Ollama", baseUrl: "http://localhost:11434/v1", model: "llama3.1" },
 ];
+
+/**
+ * Capture a rendered slide as PNG data, preserving mix-blend-mode layers.
+ * html-to-image serialises to SVG foreignObject, where blend modes are
+ * silently dropped, so we capture the content and each blend layer
+ * separately and composite them on a 2D canvas, which understands the
+ * same blend operators.
+ */
+async function captureSlidePng(
+  toPng: (node: HTMLElement, options?: Record<string, unknown>) => Promise<string>,
+  doc: Document,
+  w: number,
+  h: number,
+): Promise<string> {
+  const body = doc.body;
+  const rootEl = doc.documentElement;
+  const win = doc.defaultView!;
+  const bodyBg = win.getComputedStyle(body).backgroundColor;
+  const rootBg = win.getComputedStyle(rootEl).backgroundColor;
+  const isTransparent = (c: string) => c === "transparent" || c === "rgba(0, 0, 0, 0)";
+  const pageBg = !isTransparent(bodyBg) ? bodyBg : !isTransparent(rootBg) ? rootBg : null;
+
+  const blendEls = Array.from(body.querySelectorAll<HTMLElement>("*")).filter(
+    (el) => win.getComputedStyle(el).mixBlendMode !== "normal",
+  );
+
+  if (!blendEls.length) {
+    return toPng(body, { width: w, height: h, pixelRatio: 1, cacheBust: true, backgroundColor: pageBg ?? undefined });
+  }
+
+  type Undo = () => void;
+  const undos: Undo[] = [];
+  const setBg = (el: HTMLElement) => {
+    const css=el.getAttribute("style");undos.push(() => { if(css===null)el.removeAttribute("style");else el.setAttribute("style",css); });
+    el.style.setProperty("background", "transparent", "important");
+  };
+
+  const loadImage = (src: string) =>
+    new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("layer gagal dimuat"));
+      img.src = src;
+    });
+
+  try {
+    // Content layer without the blend overlays, on a transparent page.
+    const removed = blendEls.map((el) => {
+      const parent = el.parentNode!;
+      const next = el.nextSibling;
+      parent.removeChild(el);
+      return { parent, next, el };
+    });
+    removed.forEach(({ parent, next, el }) => void undos.push(() => parent.insertBefore(el, next)));
+    setBg(body);
+    setBg(rootEl);
+    const contentUrl = await toPng(body, { width: w, height: h, pixelRatio: 1, cacheBust: true });
+    removed.reverse().forEach(({ parent, next, el }) => parent.insertBefore(el, next));
+
+    // Blend overlays. html-to-image's foreignObject path mis-handles the
+    // grain texture's SVG filter (feTurbulence): an as-is capture applies the
+    // blend with opacity and pixel alpha ignored (uniform darkening), and an
+    // isolated capture loses the filter entirely. Data-URI SVG backgrounds
+    // are therefore rasterised natively (the browser's own SVG rasteriser
+    // evaluates the filter correctly) and tiled over the element's rect on
+    // the composite canvas, where the 2D context applies blend mode and
+    // opacity with correct alpha math. Blend content without a data-URI SVG
+    // background falls back to an isolated flat capture.
+    type NativeOverlay = { uri: string; x: number; y: number; w: number; h: number };
+    const overlays: { mode: string; opacity: number; url?: string; native?: NativeOverlay }[] = [];
+    for (const el of blendEls) {
+      const cs = win.getComputedStyle(el);
+      const mode = cs.mixBlendMode;
+      const opacity = parseFloat(cs.opacity || "1");
+      // The URI itself may contain single quotes (xmlns='...'), so match the
+      // quoted forms explicitly instead of excluding quotes from the payload.
+      const bgMatch = cs.backgroundImage.match(/url\((?:"(data:[^"]+)"|'(data:[^']+)'|([^)]+))\)/);
+      const bgUri = bgMatch?.[1] ?? bgMatch?.[2] ?? bgMatch?.[3];
+      if (bgUri?.startsWith("data:image/svg+xml,") && (cs.backgroundSize === "auto" || cs.backgroundSize === "auto auto")) {
+        const rect = el.getBoundingClientRect();
+        overlays.push({ mode, opacity, native: { uri: bgUri, x: rect.left, y: rect.top, w: rect.width, h: rect.height } });
+        continue;
+      }
+      const savedCss=el.getAttribute("style");
+      const restoreStyle=()=>{if(savedCss===null)el.removeAttribute("style");else el.setAttribute("style",savedCss)};
+      undos.push(restoreStyle);
+      el.style.setProperty("mix-blend-mode", "normal", "important");
+      el.style.setProperty("opacity", "1", "important");
+      const parent = el.parentNode!;
+      const siblings = Array.from(parent.children).filter((c) => c !== el) as HTMLElement[];
+      const styles = siblings.map((s) => s.getAttribute("style"));
+      siblings.forEach((s) => s.style.setProperty("visibility","hidden","important"));
+      let url:string;
+      try{url = await toPng(body, { width: w, height: h, pixelRatio: 1, cacheBust: true });}
+      finally{siblings.forEach((s,i)=>{const css=styles[i];if(css===null)s.removeAttribute("style");else s.setAttribute("style",css)});restoreStyle();}
+      overlays.push({ mode, opacity, url });
+    }
+
+    const canvas = doc.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d")!;
+    if (pageBg) {
+      ctx.fillStyle = pageBg;
+      ctx.fillRect(0, 0, w, h);
+    }
+    ctx.drawImage(await loadImage(contentUrl), 0, 0);
+    for (const overlay of overlays) {
+      ctx.globalCompositeOperation = overlay.mode as GlobalCompositeOperation;
+      ctx.globalAlpha = overlay.opacity;
+      if (overlay.native) {
+        const img = await loadImage(overlay.native.uri);
+        const pat = ctx.createPattern(img, "repeat");
+        if (pat) {
+          ctx.save();
+          ctx.translate(overlay.native.x, overlay.native.y);
+          ctx.fillStyle = pat;
+          ctx.fillRect(0, 0, overlay.native.w, overlay.native.h);
+          ctx.restore();
+        }
+      } else if (overlay.url) {
+        ctx.drawImage(await loadImage(overlay.url), 0, 0);
+      }
+    }
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    return canvas.toDataURL("image/png");
+  } finally {
+    for (let i = undos.length - 1; i >= 0; i--) undos[i]();
+  }
+}
 
 export default function App() {
   const boot = useStudio((s) => s.boot);
@@ -115,6 +282,7 @@ export default function App() {
   const selectedSlideId = useStudio((s) => s.selectedSlideId);
   const status = useStudio((s) => s.status);
   const statusMessage = useStudio((s) => s.statusMessage);
+  const streamingReasoning=useStudio(s=>s.streamingReasoning);
   const streamingText = useStudio((s) => s.streamingText);
   const liveTools = useStudio((s) => s.liveTools);
   const toast = useStudio((s) => s.toast);
@@ -123,6 +291,19 @@ export default function App() {
   const loadSample = useStudio((s) => s.loadSample);
   const duplicateDeck = useStudio((s) => s.duplicateDeck);
   const deleteDeck = useStudio((s) => s.deleteDeck);
+  const recoverableDraft=useStudio(s=>s.recoverableDraft);
+  const recoveringDraft=useStudio(s=>s.recoveringDraft);
+  const savingRecoveryCopy=useStudio(s=>s.savingRecoveryCopy);
+  const recoverLocalDraft=useStudio(s=>s.recoverLocalDraft);
+  const dismissLocalDraft=useStudio(s=>s.dismissLocalDraft);
+  const draftWarning=useStudio(s=>s.draftWarning);
+  const saveState=useStudio(s=>s.saveState);
+  const saveError=useStudio(s=>s.saveError);
+  const saveRecoveryCopy=useStudio(s=>s.saveRecoveryCopy);
+  const historyCounts=useStudio(s=>s.historyCounts);
+  const stepHistory=useStudio(s=>s.stepHistory);
+  const refreshHistory=useStudio(s=>s.refreshHistory);
+  useEffect(()=>{void refreshHistory();},[deck.id,refreshHistory]);
   const saveDeck = useStudio((s) => s.saveDeck);
   const updateDeck = useStudio((s) => s.updateDeck);
   const selectSlide = useStudio((s) => s.selectSlide);
@@ -136,7 +317,11 @@ export default function App() {
   const clearChat = useStudio((s) => s.clearChat);
   const references = useStudio((s) => s.references);
   const lints = useStudio((s) => s.lints);
+  const mergeGeometryLints = useStudio((s) => s.mergeGeometryLints);
+  const stopAgent = useStudio((s) => s.stopAgent);
   const revisions = useStudio((s) => s.revisions);
+  const bootError=useStudio(s=>s.bootError);
+  const reviewHistory=useStudio(s=>s.reviewHistory);
   const refreshRevisions = useStudio((s) => s.refreshRevisions);
   const restoreRevision = useStudio((s) => s.restoreRevision);
   const attachReferenceData = useStudio((s) => s.attachReferenceData);
@@ -148,33 +333,70 @@ export default function App() {
   const addComment = useStudio((s) => s.addComment);
   const setCommentStatus = useStudio((s) => s.setCommentStatus);
   const deleteComment = useStudio((s) => s.deleteComment);
+  const [noteMutationBusy,setNoteMutationBusy]=useState("");
+  const noteMutationRef=useRef(false);
+  const mutateNote=async(id:string,operation:()=>Promise<void>)=>{if(noteMutationRef.current)return;noteMutationRef.current=true;setNoteMutationBusy(id);try{await operation()}catch(err){useStudio.getState().notify("error",`Catatan belum diperbarui: ${String(err)}`)}finally{noteMutationRef.current=false;setNoteMutationBusy("")}};
   const saveSettings = useStudio((s) => s.saveSettings);
   const notify = useStudio((s) => s.notify);
   const activeCommentId = useStudio((s) => s.activeCommentId);
   const setActiveComment = useStudio((s) => s.setActiveComment);
   const clearToast = useStudio((s) => s.clearToast);
 
+  const [projectQuery,setProjectQuery]=useState("");
+  const [deleteRequest,setDeleteRequest]=useState<{kind:"project"|"template";id:string;title:string}|null>(null);
+  const [deleting,setDeleting]=useState(false);
+  const deletionDialog=useRef<HTMLDivElement>(null);
+  const deletingRef=useRef(false);deletingRef.current=deleting;
+  useEffect(()=>{if(!deleteRequest)return;const previous=document.activeElement as HTMLElement|null;deletionDialog.current?.querySelector<HTMLButtonElement>("button")?.focus();const key=(e:KeyboardEvent)=>{e.stopImmediatePropagation();if(e.key==="Escape"){e.preventDefault();if(!deletingRef.current)setDeleteRequest(null)}if(e.key==="Tab"){const controls=Array.from(deletionDialog.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")??[]);const at=controls.indexOf(document.activeElement as HTMLButtonElement);e.preventDefault();controls[e.shiftKey?(at<=0?controls.length-1:at-1):(at+1)%controls.length]?.focus()}};window.addEventListener("keydown",key,true);return()=>{window.removeEventListener("keydown",key,true);previous?.focus()}},[deleteRequest]);
+  const [deleteError,setDeleteError]=useState("");
   const [left, setLeft] = useState<LeftTab>("chat");
   const [right, setRight] = useState<RightTab>("design");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [refsExpanded, setRefsExpanded] = useState(false);
+  const [inspector, setInspector] = useState(false);
+  const [mobilePane,setMobilePane]=useState<"chat"|"canvas">("canvas");
+  const [view, setView] = useState<"board" | "focus">("focus");
   const [draft, setDraft] = useState("");
   const [pinning, setPinning] = useState(false);
-  const [pinAt, setPinAt] = useState<{ x: number; y: number; selector: string } | null>(null);
+  const [pinAt, setPinAt] = useState<{ x: number; y: number; selector: string;deckId:string;slideId:string } | null>(null);
   const [pinText, setPinText] = useState("");
+  const [pinSaving,setPinSaving]=useState(false),[pinError,setPinError]=useState("");
+  const pinSavingRef=useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [templateName, setTemplateName] = useState("");
   const [templateNote, setTemplateNote] = useState("");
+  const [templateSaving,setTemplateSaving]=useState(false);const templateSavingRef=useRef(false);const [templateError,setTemplateError]=useState("");
+  const projectInput=useRef<HTMLInputElement>(null);
+  const [projectBusy,setProjectBusy]=useState(false);const projectBusyRef=useRef(false);
+  const backupProject=async()=>{if(projectBusyRef.current)return;projectBusyRef.current=true;setProjectBusy(true);try{await saveDeck();const content=await api.exportProject(deck.id);const name=`${slug(deck.title||"project")}.desel.json`;if(api.isTauri){const dir=await api.exportDefaultDir(slug(deck.title||"project"));const result=await api.writeExport(dir,[{name,encoding:"utf8",data:content}]);notify("ok",`Backup tersimpan di ${result.directory}. Akun/API key dan chat tidak disertakan.`);}else{const blob=new Blob([content],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);notify("ok","Proyek dan aset dibackup. Akun/API key dan chat tidak disertakan.");}}catch(e){notify("error",String(e));}finally{projectBusyRef.current=false;setProjectBusy(false);}};
+  const restoreProject=async(file?:File)=>{if(!file||projectBusyRef.current)return;if(file.size>32*1024*1024){notify("error","File proyek maksimal32MB.");return;}projectBusyRef.current=true;setProjectBusy(true);const source=useStudio.getState().deck;try{const imported=await api.importProject(await file.text());await useStudio.getState().refreshDecks();if(useStudio.getState().deck!==source){notify("info","Salinan impor tersimpan di daftar proyek; edit terbaru tetap terbuka.");return;}await useStudio.getState().openDeck(imported.id);if(useStudio.getState().deck.id!==imported.id){const detail=useStudio.getState().toast?.text;notify("info",`Salinan impor tersimpan di daftar proyek, tetapi belum dibuka. Proyek saat ini tetap terbuka.${detail?` ${detail}`:""}`);return;}notify("ok","Proyek dipulihkan sebagai salinan baru. Proyek lama tidak ditimpa.");}catch(e){notify("error",String(e));}finally{projectBusyRef.current=false;setProjectBusy(false);if(projectInput.current)projectInput.current.value="";}};
   const [exportOpen, setExportOpen] = useState(false);
   const [exportPng, setExportPng] = useState(true);
   const [exportPdf, setExportPdf] = useState(false);
+  const [preflight,setPreflight]=useState<ExportPreflight|null>(null);
+  const [checkingExport,setCheckingExport]=useState(false);
+  const [ackExport,setAckExport]=useState(false);
+  const checkExport=async()=>{setCheckingExport(true);setAckExport(false);setPreflight(null);try{const result=await inspectExport(deck,frames.current);if(exportRevision(useStudio.getState().deck)===result.revision)setPreflight(result);}catch(err){notify("error",`Pemeriksaan ekspor gagal: ${String(err)}`);}finally{setCheckingExport(false);}};
   const [exportCaption, setExportCaption] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const exportingRef=useRef(false);
+  const closeExport=()=>{if(!exportingRef.current)setExportOpen(false)};
+  useEffect(()=>{if(!exportOpen)return;const key=(e:KeyboardEvent)=>{if(e.key==="Escape"&&exportingRef.current){e.preventDefault();e.stopImmediatePropagation()}};window.addEventListener("keydown",key,true);return()=>window.removeEventListener("keydown",key,true)},[exportOpen]);
+  const [lastExport,setLastExport]=useState<{directory:string;files:string[]}|null>(null);
   const [refUrl, setRefUrl] = useState("");
   const [refUrlOpen, setRefUrlOpen] = useState(false);
   const [refBusy, setRefBusy] = useState(false);
+  const [compareRevision,setCompareRevision]=useState<import("./lib/types").SlideRevision|null>(null);
+  const [brandOpen,setBrandOpen]=useState(false);
+  const [libraryOpen,setLibraryOpen]=useState(false);
+  const assetCopySaver=useRef<ReturnType<typeof createAssetCopySaver>|null>(null);
+  if(!assetCopySaver.current)assetCopySaver.current=createAssetCopySaver();
+  const [editingAsset,setEditingAsset]=useState<import("./lib/types").Asset|null>(null);
 
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  const followingChat = useRef(true);
   const fileRef = useRef<HTMLInputElement>(null);
   /** Hidden full-size renders used by the exporter. */
   const frames = useRef<(HTMLIFrameElement | null)[]>([]);
@@ -198,16 +420,15 @@ export default function App() {
     fileRef.current?.click();
   }, [attachReferencePaths, notify]);
 
+  const refBusyRef=useRef(false);
   const submitReferenceUrl = useCallback(async () => {
     const value = refUrl.trim();
-    if (!value || refBusy) return;
-    setRefBusy(true);
+    if (!value || refBusyRef.current) return;
+    refBusyRef.current=true;setRefBusy(true);
     try {
-      await attachReferenceUrl(value);
-      setRefUrl("");
-      setRefUrlOpen(false);
+      if(await attachReferenceUrl(value)){setRefUrl("");setRefUrlOpen(false);}
     } finally {
-      setRefBusy(false);
+      refBusyRef.current=false;setRefBusy(false);
     }
   }, [attachReferenceUrl, refBusy, refUrl]);
 
@@ -217,9 +438,9 @@ export default function App() {
     () => comments.filter((c) => c.slideId === selected?.id),
     [comments, selected?.id],
   );
-  const openNotes = comments.filter((c) => c.status === "open").length;
+  const openNotes = comments.filter((c) => c.status === "open" && deck.slides.some((s) => s.id === c.slideId)).length;
   const reviewMessage = useMemo(() => {
-    const open = comments.filter((c) => c.status === "open");
+    const open = comments.filter((c) => c.status === "open" && deck.slides.some((s) => s.id === c.slideId));
     if (!open.length) return "";
     const lines = open.map((c) => {
       const index = deck.slides.findIndex((s) => s.id === c.slideId);
@@ -230,6 +451,11 @@ export default function App() {
     });
     return `Tolong perbaiki deck ini berdasarkan catatan review berikut. Tulis ulang slide yang perlu, jangan cuma menjelaskan.\n\n${lines.join("\n")}`;
   }, [comments, deck.slides]);
+  const [presenting,setPresenting]=useState(false);
+  const [organizerOpen,setOrganizerOpen]=useState(false);
+  const [slideSearchOpen,setSlideSearchOpen]=useState(false);
+  const [projectReviewOpen,setProjectReviewOpen]=useState(false);
+  const [aspectChange,setAspectChange]=useState<{deckId:string;from:Deck["aspect"];to:Deck["aspect"]}|null>(null);
   const busy = status === "generating";
 
   useEffect(() => {
@@ -239,11 +465,16 @@ export default function App() {
   useEffect(() => {
     if (selected?.id) void refreshRevisions(selected.id);
   }, [selected?.id, refreshRevisions]);
+  // Opening the drawer re-reads revisions: commits made while it was closed
+  // (including conflict-preserved agent versions) must show immediately.
+  useEffect(() => {
+    if (inspector && selected?.id) void refreshRevisions(selected.id);
+  }, [inspector, selected?.id, refreshRevisions]);
 
   useEffect(() => {
     const el = logRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length, streamingText, liveTools.length]);
+    if (el && followingChat.current) el.scrollTop = el.scrollHeight;
+  }, [messages.length, streamingText, streamingReasoning,liveTools.length]);
 
   useEffect(() => {
     if (!toast) return;
@@ -254,7 +485,8 @@ export default function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); void saveDeck(); }
+      if(mod&&e.key.toLowerCase()==="z"&&!(e.target as HTMLElement)?.closest("input, textarea, [contenteditable=true], .cv")){e.preventDefault();void stepHistory(e.shiftKey?"redo":"undo");}
+      if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); void saveDeck().catch(()=>undefined); }
       if (mod && e.key.toLowerCase() === "e") { e.preventDefault(); setExportOpen(true); }
       if (mod && e.key === ",") { e.preventDefault(); setSettingsOpen(true); }
       if (!mod && e.key.toLowerCase() === "c" && !(e.target as HTMLElement)?.closest("input, textarea, .cv")) {
@@ -263,42 +495,93 @@ export default function App() {
         setRight("notes");
       }
       if (e.key === "Escape") {
+        if(!deleting)setDeleteRequest(null);
+        setMenuOpen(false);
         setSettingsOpen(false);
-        setTemplateOpen(false);
+        if(!templateSavingRef.current)setTemplateOpen(false);
         setExportOpen(false);
-        setPinAt(null);
+        setInspector(false);
+        if(!pinSavingRef.current)setPinAt(null);
         setPinning(false);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [saveDeck]);
+  }, [saveDeck,stepHistory,deleting]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (e: PointerEvent) => {if (!(e.target as HTMLElement)?.closest(".topbar-menu")) setMenuOpen(false);};
+    document.addEventListener("pointerdown",close);
+    return () => document.removeEventListener("pointerdown",close);
+  },[menuOpen]);
 
   const send = useCallback(async () => {
     const text = draft.trim();
     if (!text || busy) return;
+    followingChat.current = true;
     setDraft("");
     if (composerRef.current) composerRef.current.style.height = "auto";
-    await sendMessage(text);
+    const sent = await sendMessage(text);
+    if (!sent) setDraft(current => current || text);
     void refreshRevisions();
   }, [draft, busy, sendMessage, refreshRevisions]);
 
+  // Geometry lints (overlap) need a rendered layout, so measure the offscreen
+  // preview iframes after each slide change settles and merge with string lints.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const geo: Record<string, LintIssue[]> = {};
+      deck.slides.forEach((s, i) => {
+        const doc = frames.current[i]?.contentDocument ?? undefined;
+        if (!doc) return;
+        const found = measureOverlapIssues(doc);
+        if (found.length) geo[s.id] = found;
+      });
+      mergeGeometryLints(geo);
+      // Forward to the desktop agent so it can self-correct what the user sees
+      // in the lint panel; the browser shim keeps findings local to the UI.
+      const lines: string[] = [];
+      deck.slides.forEach((s, i) => {
+        for (const issue of geo[s.id] ?? []) lines.push(`Slide ${i + 1} ("${s.title}"): ${issue.message}`);
+      });
+      for(const [sid,history]of Object.entries(useStudio.getState().reviewHistory)){if(history.lastClear&&deck.slides.some(s=>s.id===sid))lines.push(`Previously mechanically-reviewed slide ${sid}; stage layout-only changes before commit. Mechanical-zero is not quality approval.`);}
+      void api.reportGeometryLints(deck.id, lines);
+    }, 700);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deck.slides]);
+
   const submitPin = async () => {
-    if (!pinAt || !selected || !pinText.trim()) return;
-    await addComment(selected.id, pinAt.x, pinAt.y, pinText.trim(), pinAt.selector);
-    setPinText("");
-    setPinAt(null);
-    setPinning(false);
-    setRight("notes");
+    if (pinSavingRef.current||!pinAt || !selected || !pinText.trim()) return;
+    if(useStudio.getState().deck.id!==pinAt.deckId||selected.id!==pinAt.slideId){setPinError("Slide berubah. Tutup catatan ini dan tandai slide yang dituju lagi.");return;}
+    pinSavingRef.current=true;setPinSaving(true);setPinError("");
+    try{await addComment(selected.id, pinAt.x, pinAt.y, pinText.trim(), pinAt.selector);setPinText("");setPinAt(null);setPinning(false);setRight("notes");}
+    catch(e){setPinError(String(e));}
+    finally{pinSavingRef.current=false;setPinSaving(false);}
   };
 
   const openSettings = async () => {
     setSettingsOpen(true);
   };
 
+  useEffect(()=>{
+    const capture=async(e:Event)=>{const {request_id,index,revision,candidate}=(e as CustomEvent<{request_id:string;index:number;revision?:string;candidate?:{base:Slide;slide:Slide;aspect:Deck["aspect"]}}>).detail;
+      if(candidate&&revision){const dimensions=aspectSize(candidate.aspect);const receipt=await evaluateLayoutCandidate(candidate.base,candidate.slide,candidate.aspect,html=>safeDoc(html,dimensions.w,dimensions.h));await api.submitRenderReview(deck.id,request_id,receipt);return;}
+      if(revision){const receipt=await measureRevision(()=>{const current=useStudio.getState().deck;const slide=current.slides[index];const frame=frames.current[index];const doc=frame?.contentDocument;if(!slide||!doc||doc.querySelector('meta[name="desel-review-revision"]')?.getAttribute("content")!==revision)return;return{doc,revision:reviewRevision(slide.id,current.aspect,slide.html)};},revision);if(!("error" in receipt)&&useStudio.getState().settings.sendReferences){try{const doc=frames.current[index]?.contentDocument;if(!doc)throw Error("render missing");const {toPng}=await import("html-to-image");const png=await captureSlidePng(toPng,doc,size.w,size.h);await api.addReferenceData(deck.id,`__render_${request_id}`,png);}catch(err){Object.assign(receipt,{pixelError:String(err)});}}const current=useStudio.getState().deck;const target=current.slides[index];if(target)useStudio.getState().acceptRenderReview(target.id,receipt);await api.submitRenderReview(deck.id,request_id,receipt);return;}
+      try{const doc=frames.current[index]?.contentDocument;if(!doc?.body)throw new Error("Render belum siap");await doc.fonts?.ready;const {toPng}=await import("html-to-image");const png=await captureSlidePng(toPng,doc,size.w,size.h);await api.addReferenceData(deck.id,`__render_${request_id}`,png);}catch(err){notify("error",`Pemeriksaan visual gagal: ${String(err)}`);}
+    };
+    window.addEventListener("desel-render-request",capture);return()=>window.removeEventListener("desel-render-request",capture);
+  },[deck.id,size.w,size.h,notify]);
+
   const runExport = async () => {
+    if(exportingRef.current)return;
+    if(busy)return notify("error","Hentikan atau tunggu agent sebelum mengekspor.");
+    if(!preflight||preflight.revision!==exportRevision(deck))return notify("error","Periksa kesiapan ekspor untuk versi terbaru dulu.");
+    if(preflight.findings.some(f=>f.severity==="block"))return notify("error","Perbaiki penghalang ekspor terlebih dahulu.");
+    if(preflight.findings.length&&!ackExport)return notify("error","Tinjau dan akui peringatan ekspor dulu.");
     if (!deck.slides.length) return notify("info", "Belum ada slide untuk diexport.");
-    setExporting(true);
+    exportingRef.current=true;setExporting(true);
     try {
       await new Promise((r) => setTimeout(r, 120));
       const { toPng } = await import("html-to-image");
@@ -308,19 +591,61 @@ export default function App() {
 
       const pngs: { name: string; data: string }[] = [];
       const files: { name: string; encoding: "base64" | "utf8"; data: string }[] = [];
+      const skippedSlides: number[] = [];
+      const partialSlides: number[] = [];
 
+      const verifySnapshot=()=>{if(exportRevision(useStudio.getState().deck)!==preflight.revision)throw Error("Proyek berubah selama ekspor. File belum dikirim; periksa versi terbaru lalu ekspor ulang.");};
       for (const { slide, index } of visible) {
+        verifySnapshot();
         const frame = frames.current[index];
         const body = frame?.contentDocument?.body;
         if (!body) throw new Error(`Render slide ${index + 1} belum siap, coba lagi.`);
-        await (frame!.contentDocument!.fonts?.ready ?? Promise.resolve());
-        const url = await toPng(body, {
-          width: size.w,
-          height: size.h,
-          pixelRatio: 1,
-          cacheBust: true,
-          backgroundColor: "#111111",
-        });
+        const doc = frame!.contentDocument!;
+        if(doc.querySelector('meta[name="desel-review-revision"]')?.getAttribute('content')!==reviewRevision(slide.id,deck.aspect,slide.html))throw Error(`Render slide ${index+1} berubah; periksa ulang sebelum ekspor.`);
+        await Promise.race([doc.fonts?.ready??Promise.resolve(),new Promise<never>((_,reject)=>setTimeout(()=>reject(Error("Font belum siap setelah10detik")),10000))]);
+        // html-to-image has no fetch timeout; a hung image request would
+        // otherwise freeze the whole export forever.
+        const captureWithTimeout = () =>
+          Promise.race([
+            captureSlidePng(toPng, doc, size.w, size.h),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("render timeout 30 detik")), 30_000)),
+          ]);
+        let url: string;
+        try {
+          url = await captureWithTimeout();
+        } catch (err) {
+          // A remote image the browser cannot fetch (CORS) otherwise kills the
+          // whole export with an opaque error. Exporting without the image
+          // changes the user's content, so it only happens after they say yes.
+          const remoteImgs = Array.from(body.querySelectorAll<HTMLImageElement>("img")).filter((img) =>
+            /^https?:\/\//.test(img.src),
+          );
+          if (!remoteImgs.length) throw new Error(`Slide ${index + 1} gagal dirender: ${String(err)}`);
+          const allowPartial = window.confirm(
+            `Slide ${index + 1} punya ${remoteImgs.length} gambar remote yang tidak bisa dimuat dari browser (CORS).\n\n` +
+              `OK = ekspor slide ini TANPA gambar itu.\nBatal = lewati slide ini sepenuhnya.\n\n` +
+              `App desktop mencoba mengunduh gambar remote lebih dulu. Jika gagal, gunakan gambar lokal lalu ekspor ulang.`,
+          );
+          if (!allowPartial) {
+            skippedSlides.push(index + 1);
+            continue;
+          }
+          // Hiding is not enough: html-to-image clones the DOM and still tries
+          // to fetch every img it finds. Remove them for the retry, then restore.
+          const removedImgs = remoteImgs.map((img) => {
+            const parent = img.parentNode!;
+            const next = img.nextSibling;
+            parent.removeChild(img);
+            return { parent, next, img };
+          });
+          try {
+            url = await captureWithTimeout();
+          } finally {
+            removedImgs.forEach(({ parent, next, img }) => parent.insertBefore(img, next));
+          }
+          partialSlides.push(index + 1);
+        }
+        verifySnapshot();
         const data = url.split(",")[1] ?? "";
         const name = `${String(index + 1).padStart(2, "0")}-${slug(slide.title || `slide-${index + 1}`)}.png`;
         pngs.push({ name, data });
@@ -346,27 +671,41 @@ export default function App() {
         });
       }
 
+      verifySnapshot();
+      if (!pngs.length) throw new Error("Tidak ada slide yang berhasil diekspor.");
+
       if (exportCaption) {
         const caption = [
           deck.caption || deck.title,
           deck.brandHandle ? `\n${deck.brandHandle}` : "",
           "",
-          `${visible.length} slides · ${size.w}×${size.h}`,
+          `${pngs.length} exported slides · ${size.w}×${size.h}`,
           deck.styleGuide ? `\nArt direction: ${deck.styleGuide}` : "",
         ].join("\n");
         files.push({ name: "caption.txt", encoding: "utf8", data: caption });
       }
 
+      files.push({name:"export-summary.txt",encoding:"utf8",data:[`Desel export: ${deck.title}`,`Size: ${size.w}x${size.h}`,`Exported slide numbers: ${visible.filter(v=>!skippedSlides.includes(v.index+1)).map(v=>v.index+1).join(', ')}`,`Skipped slides: ${skippedSlides.join(', ')||'none'}`,`Slides without remote images: ${partialSlides.join(', ')||'none'}`,"Mechanical checks are not visual/content/rights approval."].join("\n")});
       const dir = await api.exportDefaultDir(slug(deck.title || "desel"));
+      verifySnapshot();
       const result = await api.writeExport(dir, files, settings.exportDir);
+      setLastExport(result);
       setExportOpen(false);
-      notify("ok", `Export selesai — ${result.files.length} file ditulis.`);
+      if (skippedSlides.length) {
+        notify("error", `Ekspor selesai, tapi slide ${skippedSlides.join(", ")} dilewati (gambar remote tidak bisa dimuat).`);
+      } else if (partialSlides.length) {
+        notify("info", `Ekspor selesai — slide ${partialSlides.join(", ")} diekspor tanpa gambar remote (pilihanmu tadi).`);
+      } else {
+        notify("ok", `Ekspor selesai — ${result.files.length} file ditulis.`);
+      }
     } catch (err) {
-      notify("error", `Export gagal: ${String(err)}`);
+      notify("error", `Ekspor gagal: ${String(err)}`);
     } finally {
-      setExporting(false);
+      exportingRef.current=false;setExporting(false);
     }
   };
+
+  if(bootError)return <main className="studio-recovery" role="alert"><section><p className="recovery-eyebrow">DESEL</p><h1>Data studio belum terbuka.</h1><p>{bootError}</p><button className="btn btn-primary" onClick={()=>void boot()}>Coba buka lagi</button><p className="recovery-note">Tidak ada reset data otomatis. Jika tetap gagal, simpan data aplikasi sebelum mengubah instalasi.</p></section></main>;
 
   if (!settingsLoaded) {
     return (
@@ -378,15 +717,17 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <>{projectReviewOpen&&<ProjectReview deck={deck} comments={comments} onOpen={(slideId,commentId)=>{selectSlide(slideId);setActiveComment(commentId);setView("focus");setRight("notes");setInspector(true)}} onStatus={setCommentStatus} onClose={()=>setProjectReviewOpen(false)}/>} {aspectChange&&<AspectChange from={aspectChange.from} to={aspectChange.to} slide={selected} onCancel={()=>setAspectChange(null)} onConfirm={()=>{if(deck.id!==aspectChange.deckId||deck.aspect!==aspectChange.from){notify("error","Proyek/format berubah. Tinjau kembali sebelum menerapkan.");setAspectChange(null);return}updateDeck({aspect:aspectChange.to});setAspectChange(null)}}/>} {slideSearchOpen&&<SlideSearch deck={deck} onSelect={id=>{selectSlide(id);setView("focus")}} onClose={()=>setSlideSearchOpen(false)}/>} {organizerOpen&&<SlideOrganizer deck={deck} selectedId={selected?.id??null} onSelect={selectSlide} onMove={moveSlide} onDuplicate={duplicateSlide} onDelete={deleteSlide} onVisibility={(id,hidden)=>updateSlide(id,{hidden})} onAdd={addSlide} onClose={()=>setOrganizerOpen(false)}/>} {deleteRequest&&<div className="overlay"><div ref={deletionDialog} className="modal delete-confirm" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><div className="modal-head"><h2 id="delete-title">Hapus {deleteRequest.kind==="project"?"proyek":"template"}?</h2></div><p className="delete-item-name">{deleteRequest.title}</p><p className="modal-sub">{deleteRequest.kind==="project"?"Proyek, chat, catatan, aset lokal dan riwayatnya dihapus. Tindakan ini tidak dapat dibatalkan melalui Undo. Buat backup sebelum melanjutkan jika masih diperlukan.":"Template dihapus dari pustaka. Proyek yang dibuat dari template ini tetap ada. Penghapusan tidak dapat dibatalkan."}</p>{deleteError&&<p className="model-error">{deleteError}</p>}<div className="modal-actions"><button autoFocus disabled={deleting} className="btn btn-sm" onClick={()=>setDeleteRequest(null)}>Batal</button><button className="btn btn-sm danger" disabled={deleting||busy} onClick={async()=>{if(deletingRef.current)return;deletingRef.current=true;setDeleting(true);setDeleteError("");try{if(deleteRequest.kind==="project")await deleteDeck(deleteRequest.id);else await deleteTemplate(deleteRequest.id);setDeleteRequest(null)}catch(err){setDeleteError(String(err))}finally{deletingRef.current=false;setDeleting(false)}}}>{deleting?"Menghapus...":"Hapus permanen"}</button></div></div></div>}{presenting&&<Presentation deck={deck} initialId={selected?.id??null} onClose={()=>setPresenting(false)}/>}<div className={`app clean-preview ${view === "board" ? "view-board" : "view-focus"}`}>
       {busy && <div className="progress-line" />}
+      {recoverableDraft&&<div className="draft-recovery-banner" role="status"><span>Draft lokal belum tersimpan ditemukan: {recoverableDraft.deck.title||"Tanpa judul"}. Pulihkan sebagai proyek baru, tanpa menimpa database.</span><button disabled={busy||recoveringDraft} onClick={()=>void recoverLocalDraft()}>{recoveringDraft?"Memulihkan draft...":"Pulihkan salinan draft"}</button><button disabled={recoveringDraft} onClick={dismissLocalDraft}>Abaikan draft</button></div>}
+      {saveState==="error"&&<div className="save-error-banner" role="alert"><span>Perubahan belum tersimpan. Edit lokal tetap ada di canvas.{saveError?` ${saveError}`:""}</span><button onClick={()=>void saveDeck().catch(()=>undefined)}>Coba simpan</button><button disabled={busy||savingRecoveryCopy} onClick={()=>void saveRecoveryCopy()}>{savingRecoveryCopy?"Menyimpan salinan...":"Simpan salinan pemulihan"}</button></div>}
 
       <header className="topbar">
         <div className="brand">
           <img className="brand-mark" src="/desel-icon@2x.png" alt="Desel" />
           <div>
             <div className="brand-name">Desel</div>
-            <div className="brand-sub">Carousel Studio</div>
+            <div className="brand-sub">Design workspace</div>
           </div>
         </div>
 
@@ -400,34 +741,38 @@ export default function App() {
           spellCheck={false}
         />
 
-        <div className="topbar-actions">
-          <span className={`pill ${busy ? "busy" : settings.apiKey ? "live" : ""}`} title={settings.baseUrl}>
-            <span className="pill-dot" />
-            {busy ? statusMessage || "Bekerja…" : settings.model || "belum ada model"}
-          </span>
-          <button className="btn btn-ghost btn-icon" title="Simpan (Ctrl+S)" onClick={() => void saveDeck()}>
-            <Save size={15} />
-          </button>
-          <button
-            className="btn btn-ghost btn-icon"
-            title="Simpan desain sebagai template"
-            onClick={() => {
-              setTemplateName(deck.title);
-              setTemplateOpen(true);
-            }}
-          >
-            <Layers size={15} />
-          </button>
-          <button className="btn btn-ghost btn-icon" title="Pengaturan (Ctrl+,)" onClick={() => void openSettings()}>
-            <Settings2 size={15} />
-          </button>
-          <button className="btn btn-primary btn-sm" onClick={() => setExportOpen(true)}>
-            <Download size={14} /> Export
-          </button>
-        </div>
+        <div className="topbar-menu"><button className="top-settings" aria-label="Pengaturan workspace" onClick={() => void openSettings()}><Settings2 size={16}/> Pengaturan</button>{!(settings.apiKey || settings.providerKind?.startsWith("magpie") || busy) && <button className="pill needs-key readiness-chip" title="Pilih koneksi provider dan model di Pengaturan." onClick={() => void openSettings()}><span className="pill-dot" />Hubungkan model</button>}<button className="menu-trigger" title="Menu proyek" aria-label="Menu proyek" aria-expanded={menuOpen} onClick={() => setMenuOpen(v => !v)}><MoreHorizontal size={18}/></button><div className={`topbar-actions ${menuOpen ? "menu-open" : ""}`} onClick={e=>{if((e.target as HTMLElement).closest("button"))setMenuOpen(false);}}>
+          {settings.apiKey || settings.providerKind?.startsWith("magpie") || busy ? (
+            <span className={`pill ${busy ? "busy" : "configured"}`} title={`Konfigurasi: ${settings.baseUrl}. Status koneksi belum diverifikasi.`}>
+              <span className="pill-dot" />
+              {busy ? statusMessage || "Bekerja…" : settings.model || "belum ada model"}
+            </span>
+          ) : (
+            <button
+              className="pill needs-key"
+              title="Pilih koneksi provider dan model di Pengaturan."
+              onClick={() => void openSettings()}
+            >
+              <span className="pill-dot" />
+              Hubungkan model
+            </button>
+          )}
+          <div className="menu-section-label">Proyek</div>
+          {draftWarning&&<div className="save-health error">Draft cadangan lokal tidak tersedia (batas ruang/perangkat). Simpan atau backup sebelum menutup.</div>}
+          <div className={`save-health ${saveState}`} role="status" title={saveError}>{saveState==="saved"?"Semua perubahan tersimpan lokal":saveState==="saving"?"Menyimpan perubahan…":saveState==="dirty"?"Perubahan belum tersimpan":"Belum tersimpan. Coba Simpan atau buat salinan pemulihan lokal."}</div>
+          <button className="menu-row" disabled={busy||projectBusy||!historyCounts[0]} onClick={()=>void stepHistory("undo")}><span>Batalkan perubahan proyek</span><kbd>Ctrl+Z</kbd></button>
+          <button className="menu-row" disabled={busy||projectBusy||!historyCounts[1]} onClick={()=>void stepHistory("redo")}><span>Ulangi perubahan proyek</span><kbd>Ctrl+Shift+Z</kbd></button>
+          <button className="menu-row" aria-label="Simpan" title="Simpan (Ctrl+S)" onClick={() => void saveDeck().catch(()=>undefined)}><Save size={16}/><span>Simpan deck</span><kbd>Ctrl+S</kbd></button>
+          <button className="menu-row" disabled={busy||projectBusy||savingRecoveryCopy} onClick={()=>void saveRecoveryCopy()}><Copy size={16}/><span>Simpan salinan pemulihan lokal</span></button>
+          <button className="menu-row" disabled={busy||projectBusy} onClick={()=>void backupProject()}><Download size={16}/><span>{projectBusy?"Memproses proyek…":"Backup proyek + aset"}</span></button>
+          <button className="menu-row" disabled={busy||projectBusy} onClick={()=>projectInput.current?.click()}><FolderPlus size={16}/><span>Pulihkan proyek dari file</span></button>
+          <input ref={projectInput} type="file" accept=".json,.desel.json" hidden onChange={e=>void restoreProject(e.target.files?.[0])}/>
+          <button className="menu-row" aria-label="Simpan sebagai template" onClick={() => {setTemplateName(deck.title);setTemplateError("");setTemplateOpen(true);}}><Layers size={16}/><span>Simpan sebagai template</span></button>
+        </div></div>
       </header>
 
-      <div className="workspace">
+      <nav className="mobile-workspace-switch" aria-label="Tampilan workspace"><button className={mobilePane==='chat'?'active':''} onClick={()=>setMobilePane('chat')}>Chat & proyek</button><button className={mobilePane==='canvas'?'active':''} onClick={()=>setMobilePane('canvas')}>Canvas</button></nav>
+      <div className={`workspace mobile-${mobilePane} ${inspector ? "inspector-open" : ""}`}>
         {/* ---------------- left ---------------- */}
         <aside className="panel panel-left">
           <div className="tabs">
@@ -444,33 +789,33 @@ export default function App() {
 
           {left === "chat" && (
             <div className="chat">
-              <div className="chat-log" ref={logRef}>
-                {messages.length === 0 && (
+              <div className="chat-log" ref={logRef} onScroll={e => {const el=e.currentTarget;followingChat.current=el.scrollHeight-el.clientHeight-el.scrollTop<90;}}>
+                {messages.length === 0 && !deck.slides.length && (
                   <div className="chat-hello">
                     <h2>
                       Mau bikin apa <em>hari ini?</em>
                     </h2>
                     <p>
-                      Kasih topik, audiens, atau referensi visual. Agent akan menanyakan hal yang belum jelas,
-                      riset fakta kalau perlu, lalu menulis kode HTML/CSS/SVG tiap slide dari nol.
+                      Kasih topik, audiens, atau referensi visual. Agent menanyakan yang belum jelas,
+                      riset kalau perlu, atau eksplor ide dulu sebelum mendesain.
                     </p>
                     <div className="starters">
                       <button
                         className="starter"
                         onClick={() =>
                           setDraft(
-                            "Bikin carousel 6 slide: kenapa developer Indonesia perlu personal site. Audiens developer junior. Tone tajam, visual editorial cetak, cover berani. Riset 2-3 fakta yang relevan.",
+                            "Aku ingin bahas kenapa developer perlu personal site. Bantu pikirkan arah dan format yang cocok.",
                           )
                         }
                       >
-                        <span>Carousel editorial, 6 slide</span>
+                        <span>Pikirkan ide bareng</span>
                         <ArrowRight size={14} />
                       </button>
                       <button
                         className="starter"
                         onClick={() =>
                           setDraft(
-                            "Eksplor arah visual cover dulu, copy belum final. Topik: keamanan AI agent. Gaya poster kolase merah-hitam dengan halftone dan ghost type. Tanya satu hal penting sebelum mulai.",
+                            "Eksplor satu cover keamanan AI agent. Gaya poster kolase merah-hitam dengan halftone. Copy belum final, bantu cari arah yang pas.",
                           )
                         }
                       >
@@ -496,12 +841,13 @@ export default function App() {
                   </div>
                 )}
 
+                {messages.length === 0 && deck.slides.length > 0 && <div className="chat-context"><span className="context-eyebrow">ASISTEN DESAIN</span><h2>Lanjutkan dari sini.</h2><p>{deck.slides.length} slide sudah ada di canvas. Pilih slide untuk edit langsung, atau minta perubahan lewat chat.</p><button className="context-action" onClick={() => setDraft("Tinjau deck ini. Sebutkan masalah desain tanpa mengubah slide dulu.")}>Tinjau desain <ArrowRight size={14}/></button></div>}
                 {turns.map((t) =>
                   t.kind === "user" ? (
                     <div className="msg user" key={t.id}>
                       <div className="msg-avatar">K</div>
                       <div className="msg-text">
-                        <p>{t.text}</p>
+                        <p><ChatText text={t.text}/></p>
                       </div>
                     </div>
                   ) : (
@@ -510,7 +856,8 @@ export default function App() {
                         <Sparkles size={12} />
                       </div>
                       <div className="msg-text">
-                        {t.text && <p>{t.text}</p>}
+                        {t.reasoning && <details className="provider-reasoning"><summary>Thinking - output provider</summary><p>{t.reasoning}</p></details>}
+                        {t.text && <p><ChatText text={t.text}/></p>}
                         {t.steps.length > 0 && (
                           <details className="step-group">
                             <summary>
@@ -554,6 +901,7 @@ export default function App() {
                   </div>
                 )}
 
+                {streamingReasoning && <details className="provider-reasoning"><summary>Thinking - output provider</summary><p>{streamingReasoning}</p></details>}
                 {streamingText && (
                   <div className="msg agent">
                     <div className="msg-avatar">
@@ -580,11 +928,14 @@ export default function App() {
                 )}
               </div>
 
-              <div className="refs">
+              {!busy&&deck.slides.map(slide=>{const h=reviewHistory[slide.id];return h?.regressed?<div className="completion-review" key={`regression-${slide.id}`} role="status"><span>Regresi pada {slide.title}: {h.latest.findings} temuan. Versi {h.lastClear?.revision} tanpa temuan mekanis tersimpan, belum disetujui visual/isi.</span><button className="link" onClick={()=>{selectSlide(slide.id);setRight("design");setInspector(true);void refreshRevisions(slide.id);}}>Tinjau versi dan pemulihan</button></div>:null;})}
+              {!busy&&statusMessage&&!Object.values(reviewHistory).some(h=>h.regressed)&&<div className="completion-review" role="status"><span>{statusMessage}</span>{deck.slides.some(s=>(lints[s.id]??[]).some(i=>["overlap","text-image-overlap","text-overflow"].includes(i.rule)))&&<button className="link" onClick={()=>{setDraft("Perbaiki temuan geometri pada deck ini saja. Baca slide terkait, pertahankan konten dan slide lain. Jangan klaim selesai sebelum temuan terselesaikan.");composerRef.current?.focus();}}>Siapkan revisi tata letak</button>}</div>}
+              <div className="library-entry"><button className="btn btn-sm" onClick={()=>setLibraryOpen(true)}>Pustaka aset proyek</button><button className="btn btn-sm" onClick={()=>setBrandOpen(true)}>Profil brand</button></div>
+              <div className={`refs ${refsExpanded || references.length ? "refs-expanded" : "refs-collapsed"}`}>
                 <div className="refs-head">
-                  <span>Referensi visual</span>
+                  <button className="refs-toggle" onClick={() => setRefsExpanded(v => !v)}><Paperclip size={15} strokeWidth={1.6}/> Referensi & aset <ChevronDown size={12}/></button>
                   <span className="refs-actions">
-                    <button className="link" onClick={() => setRefUrlOpen((v) => !v)}>
+                    <button className="link" disabled={refBusy} onClick={() => setRefUrlOpen((v) => !v)}>
                       Link
                     </button>
                     <button className="link" onClick={() => void pickReferences()}>
@@ -596,12 +947,13 @@ export default function App() {
                   <div className="refs-url">
                     <input
                       autoFocus
+                      disabled={refBusy}
                       value={refUrl}
                       placeholder="Tempel link gambar (Pinterest, Dribbble, ...)"
                       onChange={(e) => setRefUrl(e.target.value)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") void submitReferenceUrl();
-                        if (e.key === "Escape") setRefUrlOpen(false);
+                        if (e.key === "Escape"&&!refBusyRef.current) setRefUrlOpen(false);
                       }}
                     />
                     <button className="btn btn-sm" disabled={refBusy || !refUrl.trim()} onClick={() => void submitReferenceUrl()}>
@@ -626,7 +978,7 @@ export default function App() {
                             : r.name
                         }
                       >
-                        <img src={`data:${r.mime};base64,${r.data}`} alt={r.name} />
+                        <button className="ref-open" title="Lihat aset dan atur crop" onClick={()=>setEditingAsset(r)}><img src={`data:${r.mime};base64,${r.data}`} alt={r.name} /></button>
                         <button
                           className="ref-x"
                           title="Hapus referensi"
@@ -634,6 +986,14 @@ export default function App() {
                         >
                           <X size={10} />
                         </button>
+                        <div className="ref-intent">
+                          <select aria-label={`Peran referensi ${r.name}`} value={r.referenceRole||""} onChange={e=>void useStudio.getState().setReferenceIntent(r.id,e.target.value,r.referenceStatus||"")}>
+                            <option value="">Peran belum diatur</option><option value="cover">Cover</option><option value="body">Isi</option><option value="closer">Penutup</option><option value="asset">Aset produk</option>
+                          </select>
+                          <select aria-label={`Status referensi ${r.name}`} value={r.referenceStatus||""} onChange={e=>void useStudio.getState().setReferenceIntent(r.id,r.referenceRole||"",e.target.value)}>
+                            <option value="">Belum dinilai</option><option value="candidate">Kandidat</option><option value="approved">Disukai</option><option value="rejected">Ditolak</option>
+                          </select>
+                        </div>
                         {r.profile && (
                           <span className="ref-dots">
                             {r.profile.palette.slice(0, 4).map((c) => (
@@ -651,7 +1011,7 @@ export default function App() {
                 {references.length > 0 && (
                   <p className="refs-note">
                     {settings.sendReferences
-                      ? "Gambar dikirim ke model (vision aktif)."
+                      ? "Pengiriman gambar aktif; dukungan mengikuti kemampuan provider/model."
                       : "Model menerima palet, kontras, dan ukuran. Aktifkan vision di Pengaturan kalau modelnya bisa melihat gambar."}
                   </p>
                 )}
@@ -698,12 +1058,15 @@ export default function App() {
                     }}
                   />
                   <div className="composer-foot">
-                    <span className="composer-hint">
-                      {settings.enableResearch ? "Riset aktif" : "Riset nonaktif"} · {deck.slides.length} slide
-                    </span>
-                    <button className="send" disabled={!draft.trim() || busy} onClick={() => void send()} title="Kirim (Enter)">
-                      {busy ? <Loader2 size={15} className="spin" /> : <ArrowRight size={15} />}
-                    </button>
+                    {busy ? (
+                      <button className="send stop" onClick={() => void stopAgent()} title="Hentikan agent">
+                        <Square size={13} />
+                      </button>
+                    ) : (
+                      <button className="send" disabled={!draft.trim()} onClick={() => void send()} title="Kirim (Enter)">
+                        <ArrowRight size={15} />
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -726,12 +1089,13 @@ export default function App() {
                 </div>
               </div>
               <div className="side-list">
-                {decks.map((d) => (
-                  <button
+                <label className="project-search"><span>Cari proyek</span><input aria-label="Cari proyek" value={projectQuery} onChange={e=>setProjectQuery(e.target.value)} placeholder="Nama proyek..."/></label>
+                {decks.filter(d=>(d.title||"Tanpa judul").toLowerCase().includes(projectQuery.trim().toLowerCase())).map((d) => (
+                  <div
                     key={d.id}
                     className={`project-row ${d.id === deck.id ? "active" : ""}`}
-                    onClick={() => void openDeck(d.id)}
                   >
+                    <button className="project-open" aria-label={`Buka proyek ${d.title||"Tanpa judul"}`} onClick={()=>void openDeck(d.id)}>
                     <span className="project-swatch">{(d.title || "D").slice(0, 1).toUpperCase()}</span>
                     <span className="project-info">
                       <strong>{d.title || "Tanpa judul"}</strong>
@@ -739,30 +1103,34 @@ export default function App() {
                         {d.slideCount} slide · {when(d.updatedAt)}
                       </span>
                     </span>
+                    </button>
                     <span className="project-tools">
-                      <span
+                      <button
                         className="icon-btn"
                         title="Duplikat"
+                        aria-label={`Duplikat proyek ${d.title||"Tanpa judul"}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           void duplicateDeck(d.id);
                         }}
                       >
                         <Copy size={13} />
-                      </span>
-                      <span
+                      </button>
+                      <button
                         className="icon-btn"
                         title="Hapus"
+                        aria-label={`Hapus proyek ${d.title||"Tanpa judul"}`}
                         onClick={(e) => {
                           e.stopPropagation();
-                          void deleteDeck(d.id);
+                          setDeleteError("");setDeleteRequest({kind:"project",id:d.id,title:d.title||"Tanpa judul"});
                         }}
                       >
                         <Trash2 size={13} />
-                      </span>
+                      </button>
                     </span>
-                  </button>
+                  </div>
                 ))}
+                {decks.length>0&&!decks.some(d=>(d.title||"Tanpa judul").toLowerCase().includes(projectQuery.trim().toLowerCase()))&&<div className="empty-note">Tidak ada proyek dengan nama ini.</div>}
                 {!decks.length && <div className="empty-note">Belum ada proyek. Mulai dari chat atau tombol Baru.</div>}
               </div>
             </div>
@@ -773,7 +1141,7 @@ export default function App() {
               <div className="panel-section">
                 <div className="section-title">
                   <span>Design system tersimpan</span>
-                  <button className="link" onClick={() => { setTemplateName(deck.title); setTemplateOpen(true); }}>
+                  <button className="link" onClick={() => { setTemplateName(deck.title);setTemplateError(""); setTemplateOpen(true); }}>
                     Simpan ini
                   </button>
                 </div>
@@ -793,7 +1161,7 @@ export default function App() {
                         </small>
                       </span>
                     </button>
-                    <span className="icon-btn" title="Hapus template" onClick={() => void deleteTemplate(t.id)}>
+                    <span className="icon-btn" title="Hapus template" onClick={() => {setDeleteError("");setDeleteRequest({kind:"template",id:t.id,title:t.name})}}>
                       <Trash2 size={13} />
                     </span>
                   </div>
@@ -805,7 +1173,7 @@ export default function App() {
         </aside>
 
         {/* ---------------- stage ---------------- */}
-        <main className="stage">
+        <main className={`stage ${inspector ? "inspector-visible" : ""}`}>
           <div className="stage-bar">
             <div className="stage-title">
               {selected ? (
@@ -814,6 +1182,11 @@ export default function App() {
                   <span style={{ color: "var(--text-3)", fontSize: 11 }}>
                     {deck.slides.indexOf(selected) + 1}/{deck.slides.length}
                   </span>
+                  {busy && (
+                    <span className="stage-live" title="Agent sedang mengedit canvas — perubahan muncul langsung">
+                      <i /> live
+                    </span>
+                  )}
                 </>
               ) : (
                 <strong>Canvas</strong>
@@ -821,6 +1194,21 @@ export default function App() {
             </div>
 
             <div className="stage-bar-actions">
+              <button
+                className={`icon-btn ${view === "board" ? "on" : ""}`}
+                title="Papan: semua slide terhampar"
+                onClick={() => setView("board")}
+              >
+                <LayoutGrid size={15} /><span>Papan</span>
+              </button>
+              <button
+                className={`icon-btn ${view === "focus" ? "on" : ""}`}
+                title="Fokus: satu artboard untuk diedit"
+                onClick={() => setView("focus")}
+              >
+                <Scan size={15} /><span>Edit slide</span>
+              </button>
+              <span className="topbar-divider" />
               <label style={{ display: "flex", alignItems: "center", gap: 4, position: "relative" }}>
                 <select
                   value={deck.aspect}
@@ -846,26 +1234,68 @@ export default function App() {
                 </select>
                 <ChevronDown size={12} style={{ position: "absolute", right: 7, pointerEvents: "none", color: "var(--text-2)" }} />
               </label>
+              <button
+                className={`icon-btn ${inspector ? "on" : ""}`}
+                title={inspector ? "Tutup panel desain" : "Buka panel desain (properti, kode, catatan)"}
+                onClick={() => setInspector((v) => !v)}
+              >
+                <PanelRight size={16} strokeWidth={1.6} /><span>Properti</span>
+              </button>
 
             </div>
           </div>
 
           <div className="stage-area">
+            <button className="canvas-present" disabled={!deck.slides.some(s=>!s.hidden)} onClick={()=>{window.dispatchEvent(new Event("desel-before-context-switch"));setPresenting(true)}}><Maximize2 size={14}/> Presentasi</button>
+            <button className="canvas-export" disabled={!deck.slides.length} onClick={() => setExportOpen(true)}><Download size={14}/> Ekspor</button>
+            <nav className="canvas-palette" aria-label="Alat canvas">
+              <button title="Pilih dan edit elemen" aria-label="Pilih elemen" className={!pinning && view === "focus" ? "on" : ""} onClick={() => {setPinning(false);setView("focus");}}><MousePointer2 size={17}/></button>
+              <button title="Review catatan seluruh proyek" aria-label="Review seluruh proyek" onClick={()=>setProjectReviewOpen(true)}><MessageSquare size={17}/></button>
+              <button title="Cari teks dalam proyek" aria-label="Cari teks slide" onClick={()=>{window.dispatchEvent(new Event("desel-before-context-switch"));setSlideSearchOpen(true)}}><Search size={17}/></button>
+              <button title="Kelola urutan dan visibilitas slide" aria-label="Kelola slide" onClick={()=>{window.dispatchEvent(new Event("desel-before-context-switch"));setOrganizerOpen(true)}}><Layers size={17}/></button>
+              <button disabled={!deck.slides.length} title="Lihat semua slide" aria-label="Lihat semua slide" className={view === "board" ? "on" : ""} onClick={() => setView("board")}><LayoutGrid size={17}/></button>
+              <button disabled={!selected} title="Edit teks: klik dua kali teks pada slide" aria-label="Mode edit teks" onClick={() => {setView("focus");setPinning(false);notify("info","Klik dua kali teks pada slide untuk mengedit.");}}><Type size={17}/></button>
+              <button title="Properti dan riwayat slide" aria-label="Properti dan riwayat slide" onClick={() => {setRight("design");setInspector(v => !v);}}><Layers size={17}/></button>
+              <button disabled={!selected} title="Tambah catatan pada slide" aria-label="Tambah catatan" className={pinning ? "on" : ""} onClick={() => {setView("focus");setPinning(v => !v);}}><MessageSquare size={17}/></button>
+            </nav>
             {!deck.slides.length ? (
               <div className="empty-stage">
                 <img className="mark" src="/desel-icon@2x.png" alt="" />
                 <h1>Mulai dari satu sudut pandang.</h1>
                 <p>
                   Belum ada slide. Ceritakan subjek, audiens, dan rasa visual yang kamu mau —
-                  agent akan menyusun design system lalu menulis tiap slide sebagai kode asli.
+                  slide pertama muncul di sini sambil agent mendesain.
                 </p>
-                <button className="btn btn-primary" onClick={() => { setLeft("chat"); composerRef.current?.focus(); }}>
+                <button className="btn btn-primary" onClick={() => { setLeft("chat");setMobilePane("chat"); composerRef.current?.focus(); }}>
                   <Wand2 size={14} /> Tulis brief
                 </button>
               </div>
+            ) : view === "board" ? (
+              <Board
+                slides={deck.slides.filter((s) => !s.hidden).map((s) => ({ ...s, html: safeDoc(s.html, size.w, size.h) }))}
+                activeId={selected?.id ?? null}
+                width={size.w}
+                height={size.h}
+                noteCounts={comments
+                  .filter((c) => c.status === "open")
+                  .reduce<Record<string, number>>((acc, c) => {
+                    acc[c.slideId] = (acc[c.slideId] ?? 0) + 1;
+                    return acc;
+                  }, {})}
+                onSelect={(id) => selectSlide(id)}
+                onFocus={(id) => {
+                  selectSlide(id);
+                  setView("focus");
+                }}
+              />
             ) : selected ? (
               <Canvas
                 doc={safeDoc(selected.html, size.w, size.h)}
+                assets={references}
+                deckKey={deck.id}
+                neighbour={deck.slides.filter(s => !s.hidden && s.id !== selected.id).map(s => ({id:s.id,title:s.title,doc:safeDoc(s.html,size.w,size.h)}))[0]}
+                onSelectNeighbour={id => selectSlide(id)}
+                slideTitle={`Slide ${deck.slides.indexOf(selected)+1} · ${selected.title}` }
                 slideKey={selected.id}
                 width={size.w}
                 height={size.h}
@@ -875,15 +1305,17 @@ export default function App() {
                 onTogglePinning={() => {
                   setPinning((v) => !v);
                   setRight("notes");
+                  setInspector(true);
                 }}
-                onRequestPin={(x, y, selector) => setPinAt({ x, y, selector })}
+                onRequestPin={(x, y, selector) => {setPinError("");setPinAt({ x, y, selector,deckId:deck.id,slideId:selected.id })}}
                 onSelectNote={(id) => {
                   setRight("notes");
+                  setInspector(true);
                   setActiveComment(id);
                 }}
-                onEditHtml={(html) => {
-                  updateSlide(selected.id, { html });
-                  notify("ok", "Teks di canvas diperbarui.");
+                onEditHtml={(html,slideId) => {
+                  updateSlide(slideId, { html });
+                  notify("ok", "Elemen canvas diperbarui.");
                 }}
                 onNotify={(text) => notify("info", text)}
               />
@@ -894,13 +1326,13 @@ export default function App() {
                 className="overlay"
                 style={{ background: "transparent", backdropFilter: "none", placeItems: "start end", padding: 0 }}
                 onMouseDown={(e) => {
-                  if (e.target === e.currentTarget) setPinAt(null);
+                  if (e.target === e.currentTarget&&!pinSavingRef.current) setPinAt(null);
                 }}
               >
                 <div className="modal" style={{ width: 300, margin: "0 24px 24px 0" }}>
                   <div className="modal-head">
                     <h2 style={{ fontSize: 19 }}>Catatan baru</h2>
-                    <button className="icon-btn" onClick={() => setPinAt(null)}>
+                    <button className="icon-btn" disabled={pinSaving} onClick={() => setPinAt(null)}>
                       <X size={15} />
                     </button>
                   </div>
@@ -908,6 +1340,7 @@ export default function App() {
                   <div className="field">
                     <span>Komentar</span>
                     <textarea
+                      disabled={pinSaving}
                       autoFocus
                       value={pinText}
                       onChange={(e) => setPinText(e.target.value)}
@@ -915,12 +1348,13 @@ export default function App() {
                       style={{ minHeight: 88 }}
                     />
                   </div>
+                  {pinError&&<p className="model-error pin-error" role="alert">{pinError}</p>}
                   <div className="modal-actions" style={{ marginTop: 8 }}>
-                    <button className="btn btn-ghost btn-sm" onClick={() => setPinAt(null)}>
+                    <button className="btn btn-ghost btn-sm" disabled={pinSaving} onClick={() => setPinAt(null)}>
                       Batal
                     </button>
-                    <button className="btn btn-primary btn-sm" disabled={!pinText.trim()} onClick={() => void submitPin()}>
-                      Tambah
+                    <button className="btn btn-primary btn-sm" disabled={pinSaving||!pinText.trim()} onClick={() => void submitPin()}>
+                      {pinSaving?"Menyimpan...":"Tambah"}
                     </button>
                   </div>
                 </div>
@@ -930,7 +1364,7 @@ export default function App() {
 
           <div className="rail">
             <div className="rail-head">
-              <span className="label">Sequence · {deck.slides.length} slide</span>
+              <span className="label">Urutan slide · {deck.slides.length}</span>
               <div style={{ display: "flex", gap: 4 }}>
                 <button className="btn btn-ghost btn-tiny" onClick={() => selected && duplicateSlide(selected.id)} disabled={!selected}>
                   <Copy size={12} /> Duplikat
@@ -968,7 +1402,8 @@ export default function App() {
         </main>
 
         {/* ---------------- right ---------------- */}
-        <aside className="panel panel-right">
+        {inspector && (
+        <aside className="panel panel-right panel-drawer">
           <div className="tabs">
             <button className={`tab ${right === "design" ? "active" : ""}`} onClick={() => setRight("design")}>
               <Palette size={13} /> Desain
@@ -979,6 +1414,10 @@ export default function App() {
             <button className={`tab ${right === "notes" ? "active" : ""}`} onClick={() => setRight("notes")}>
               <MessageSquare size={13} /> Catatan
               {openNotes > 0 && <span className="tab-count">{openNotes}</span>}
+            </button>
+            <span className="tabs-spacer" />
+            <button className="icon-btn" title="Tutup panel (Esc)" onClick={() => setInspector(false)} autoFocus>
+              <X size={14} />
             </button>
           </div>
 
@@ -1001,7 +1440,7 @@ export default function App() {
                 <div className="field-row">
                   <label className="field">
                     <span>Format</span>
-                    <select value={deck.aspect} onChange={(e) => updateDeck({ aspect: e.target.value as Deck["aspect"] })}>
+                    <select aria-label="Format proyek" value={deck.aspect} onChange={(e) => {window.dispatchEvent(new Event("desel-before-context-switch"));const to=e.target.value as Deck["aspect"];if(!deck.slides.length)updateDeck({aspect:to});else setAspectChange({deckId:deck.id,from:deck.aspect,to})}}>
                       {ASPECTS.map((a) => (
                         <option key={a.id} value={a.id}>
                           {a.label}
@@ -1036,16 +1475,7 @@ export default function App() {
                   />
                   <small>Agent membaca ini supaya semua slide tetap satu bahasa visual.</small>
                 </label>
-                {deck.palette.length > 0 && (
-                  <div className="field">
-                    <span>Palet</span>
-                    <div className="swatches">
-                      {deck.palette.map((c) => (
-                        <span key={c} className="swatch" style={{ background: c }} title={c} />
-                      ))}
-                    </div>
-                  </div>
-                )}
+                <PaletteEditor colors={deck.palette} onChange={palette=>updateDeck({palette})}/>
               </div>
 
               {selected && (
@@ -1056,13 +1486,15 @@ export default function App() {
                     <input value={selected.title} onChange={(e) => updateSlide(selected.id, { title: e.target.value })} />
                   </label>
                   <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
-                    <button className="btn btn-sm" style={{ flex: 1 }} onClick={() => moveSlide(selected.id, -1)}>
+                    <button className="btn btn-sm" style={{ flex: 1 }} disabled={deck.slides.indexOf(selected) === 0} onClick={() => moveSlide(selected.id, -1)}>
                       <ChevronLeft size={13} /> Maju
                     </button>
-                    <button className="btn btn-sm" style={{ flex: 1 }} onClick={() => moveSlide(selected.id, 1)}>
+                    <button className="btn btn-sm" style={{ flex: 1 }} disabled={deck.slides.indexOf(selected) === deck.slides.length-1} onClick={() => moveSlide(selected.id, 1)}>
                       Mundur <ChevronRight size={13} />
                     </button>
                   </div>
+                  <label className="check slide-visibility"><input type="checkbox" checked={!selected.hidden} onChange={e=>updateSlide(selected.id,{hidden:!e.target.checked})}/><span>Sertakan slide ini di ekspor dan papan</span></label>{selected.hidden&&<p className="rev-hint">Slide disimpan, tetapi disembunyikan dari ekspor dan papan. Masih dapat dipilih melalui thumbnail.</p>}
+                  <div className="slide-manage"><button className="btn btn-sm" onClick={() => duplicateSlide(selected.id)}><Copy size={13}/> Duplikat</button><button className="btn btn-sm" onClick={() => deleteSlide(selected.id)}><Trash2 size={13}/> Hapus</button></div>
                   <button
                     className="link"
                     style={{ marginTop: 8, alignSelf: "flex-start" }}
@@ -1087,12 +1519,12 @@ export default function App() {
                   </div>
                   {(lints[selected.id] ?? []).length === 0 ? (
                     <p className="lint-clean">
-                      Tidak ada temuan: kanvas, palet, tekstur, dan hierarki lolos pemeriksaan.
+                      Tidak ada temuan mekanis saat ini. Ini bukan jaminan kualitas visual atau kebenaran isi. Periksa preview.
                     </p>
                   ) : (
                     <ul className="lint-list">
-                      {(lints[selected.id] ?? []).map((issue) => (
-                        <li key={issue.rule} className={`lint-item ${issue.severity}`}>
+                      {(lints[selected.id] ?? []).map((issue,index) => (
+                        <li key={`${issue.rule}-${index}`} className={`lint-item ${issue.severity}`}>
                           <span className="lint-dot" />
                           <span>{issue.message}</span>
                         </li>
@@ -1102,6 +1534,7 @@ export default function App() {
                 </div>
               )}
 
+              {selected&&reviewHistory[selected.id]?.regressed&&<div className="panel-section"><p>Versi {reviewHistory[selected.id].lastClear?.revision}: tanpa temuan mekanis saat direview, bukan persetujuan visual/isi. Pemulihan hanya slide ini dan perlu konfirmasi.</p><button className="link" onClick={()=>void useStudio.getState().recoverReviewed(selected.id)}>Pulihkan versi yang direview...</button></div>}
               {selected && revisions.length > 0 && (
                 <div className="panel-section">
                   <div className="section-title">
@@ -1113,8 +1546,8 @@ export default function App() {
                       <li key={rev.id} className="rev-row">
                         <span className="rev-when">{when(rev.createdAt)}</span>
                         <span className="rev-size">{Math.round(rev.html.length / 100) / 10}k</span>
-                        <button className="link" onClick={() => void restoreRevision(rev.id)}>
-                          Pulihkan
+                        <button className="link" onClick={() => setCompareRevision(rev)}>
+                          Bandingkan
                         </button>
                       </li>
                     ))}
@@ -1188,10 +1621,10 @@ export default function App() {
                       <p>{c.body}</p>
                       <div className="note-meta">
                         <span>{c.author === "agent" ? "Agent" : "Kamu"}</span>
-                        <button onClick={() => void setCommentStatus(c.id, c.status === "open" ? "resolved" : "open")}>
+                        <button disabled={!!noteMutationBusy} onClick={() => void mutateNote(c.id,()=>setCommentStatus(c.id, c.status === "open" ? "resolved" : "open"))}>
                           {c.status === "open" ? "Selesai" : "Buka lagi"}
                         </button>
-                        <button className="danger" onClick={() => void deleteComment(c.id)}>
+                        <button className="danger" disabled={!!noteMutationBusy} onClick={() => void mutateNote(c.id,()=>deleteComment(c.id))}>
                           Hapus
                         </button>
                       </div>
@@ -1202,7 +1635,7 @@ export default function App() {
               </div>
             </div>
           )}
-        </aside>
+        </aside> )}
       </div>
 
       {/* offscreen renderers used by export */}
@@ -1215,12 +1648,16 @@ export default function App() {
             }}
             title={`render-${i}`}
             sandbox="allow-same-origin"
-            srcDoc={safeDoc(s.html, size.w, size.h)}
+            srcDoc={safeDoc(s.html, size.w, size.h).replace("</head>",`<meta name="desel-review-revision" content="${reviewRevision(s.id,deck.aspect,s.html)}"></head>`)}
             style={{ width: size.w, height: size.h }}
           />
         ))}
       </div>
 
+      {compareRevision&&selected&&compareRevision.slideId===selected.id&&<RevisionCompare current={selected} revision={compareRevision} aspect={deck.aspect} onClose={()=>setCompareRevision(null)} onRestore={async()=>{if(!await restoreRevision(compareRevision.id))throw Error("Pemulihan belum selesai. Periksa pesan dan coba lagi.")}}/>}
+      {brandOpen&&<BrandLibrary deck={deck} onClose={()=>setBrandOpen(false)} onApply={updateDeck}/>}
+      {libraryOpen&&<AssetLibrary deckId={deck.id} onClose={()=>setLibraryOpen(false)} onCopied={()=>useStudio.getState().refreshReferences(deck.id)}/>}
+      {editingAsset&&<AssetEditor asset={editingAsset} onMetadataSaved={async()=>{await useStudio.getState().refreshReferences(editingAsset.deckId??deck.id);const latest=useStudio.getState().references.find(r=>r.id===editingAsset.id);if(latest)setEditingAsset(latest)}} onClose={()=>setEditingAsset(null)} onSave={async(name,data)=>{const target=editingAsset.deckId??deck.id;await assetCopySaver.current!(editingAsset,target,name,data,async()=>{if(useStudio.getState().deck.id!==target)throw Error("Proyek berubah saat menyimpan salinan aset; periksa pustaka proyek asal.");await useStudio.getState().refreshReferences(target);});}} onUse={data=>{if(!selected)throw Error("Pilih atau buat slide dulu. Aset tetap tersedia.");if(selected.html.length+data.length>4*1024*1024)throw Error("HTML slide dan gambar akan melebihi4MB. Gunakan gambar lebih kecil.");const doc=new DOMParser().parseFromString(selected.html,"text/html");const image=doc.createElement("img");image.id=`desel-image-${crypto.randomUUID()}`;image.src=data;image.alt=editingAsset.provenance?.altText||"Aset visual";image.style.cssText="position:absolute;left:8%;top:28%;width:84%;height:48%;object-fit:contain;z-index:10";doc.body.appendChild(image);updateSlide(selected.id,{html:"<!doctype html>"+doc.documentElement.outerHTML});notify("ok","Aset ditambahkan. Posisi/ukuran dapat diatur lewat kode atau chat; versi lama tetap di riwayat.");}}/>}
       {settingsOpen && (
         <SettingsModal
           settings={settings}
@@ -1230,11 +1667,11 @@ export default function App() {
       )}
 
       {templateOpen && (
-        <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && setTemplateOpen(false)}>
+        <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && !templateSavingRef.current && setTemplateOpen(false)}>
           <div className="modal">
             <div className="modal-head">
               <h2>Simpan design system</h2>
-              <button className="icon-btn" onClick={() => setTemplateOpen(false)}>
+              <button className="icon-btn" disabled={templateSaving} onClick={() => setTemplateOpen(false)}>
                 <X size={15} />
               </button>
             </div>
@@ -1243,57 +1680,65 @@ export default function App() {
             </p>
             <label className="field">
               <span>Nama</span>
-              <input value={templateName} onChange={(e) => setTemplateName(e.target.value)} placeholder="Misal: Editorial kaos kaki" />
+              <input disabled={templateSaving} value={templateName} onChange={(e) => setTemplateName(e.target.value)} placeholder="Misal: Editorial kaos kaki" />
             </label>
             <label className="field">
               <span>Catatan pemakaian</span>
-              <textarea value={templateNote} onChange={(e) => setTemplateNote(e.target.value)} placeholder="Cocok untuk…" />
+              <textarea disabled={templateSaving} value={templateNote} onChange={(e) => setTemplateNote(e.target.value)} placeholder="Cocok untuk…" />
             </label>
             <div className="modal-actions">
-              <button className="btn btn-ghost btn-sm" onClick={() => setTemplateOpen(false)}>
+              <button className="btn btn-ghost btn-sm" disabled={templateSaving} onClick={() => setTemplateOpen(false)}>
                 Batal
               </button>
               <button
                 className="btn btn-primary btn-sm"
-                disabled={!templateName.trim()}
+                disabled={templateSaving||!templateName.trim()}
                 onClick={async () => {
-                  await saveTemplate(templateName.trim(), templateNote.trim());
-                  setTemplateOpen(false);
-                  setTemplateNote("");
+                  if(templateSavingRef.current)return;
+                  templateSavingRef.current=true;setTemplateSaving(true);setTemplateError("");
+                  try{await saveTemplate(templateName.trim(), templateNote.trim());setTemplateOpen(false);setTemplateNote("");}
+                  catch(error){setTemplateError(String(error));}
+                  finally{templateSavingRef.current=false;setTemplateSaving(false);}
                 }}
               >
-                <Save size={13} /> Simpan
-              </button>
+                <Save size={13} /> {templateSaving?"Menyimpan...":"Simpan"}
+              </button>{templateError&&<p role="alert" className="model-error">{templateError}</p>}
             </div>
           </div>
         </div>
       )}
 
       {exportOpen && (
-        <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && setExportOpen(false)}>
-          <div className="modal">
+        <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && closeExport()}>
+          <div className="modal export-modal">
             <div className="modal-head">
-              <h2>Export</h2>
-              <button className="icon-btn" onClick={() => setExportOpen(false)}>
+              <h2>Ekspor</h2>
+              <button className="icon-btn" disabled={exporting} aria-label="Tutup ekspor" onClick={closeExport}>
                 <X size={15} />
               </button>
             </div>
             <p className="modal-sub">
-              Dirender dari HTML yang sama dengan preview, jadi hasilnya identik.
+              Dirender dari HTML preview. Periksa gambar, font, dan peringatan; hasil dapat berbeda bila aset gagal dimuat.
             </p>
+            {lastExport&&<p className="export-last">Ekspor terakhir: {lastExport.files.length} file<br/><code>{lastExport.directory}</code>{"__TAURI_INTERNALS__" in window&&<button className="btn btn-sm" onClick={()=>void api.revealPath(lastExport.directory).catch(e=>notify("error",String(e)))}>Buka folder</button>}</p>}
+            <div className="export-preflight"><button className="btn btn-sm" disabled={checkingExport||exporting} onClick={()=>void checkExport()}>{checkingExport?"Memeriksa render…":"Periksa kesiapan ekspor"}</button>
+            <p>Pemeriksaan mekanis, bukan persetujuan visual, fakta, atau hak pakai.</p>
+            {preflight&&preflight.revision!==exportRevision(deck)&&<p role="alert">Slide berubah. Periksa ulang sebelum ekspor.</p>}
+            {preflight&&preflight.revision===exportRevision(deck)&&<><p>{preflight.slides} slide · {preflight.findings.filter(f=>f.severity==="block").length} penghalang · {preflight.findings.filter(f=>f.severity==="warn").length} peringatan</p><div className="preflight-findings">{preflight.findings.map((f,i)=><button key={i} className={`preflight-finding ${f.severity}`} disabled={exporting} onClick={()=>{if(f.slideId)selectSlide(f.slideId);setExportOpen(false);}}>{f.slideId?`Slide ${f.index+1}: `:""}{f.message} →</button>)}</div>{preflight.findings.some(f=>f.severity==="warn")&&!preflight.findings.some(f=>f.severity==="block")&&<label className="check"><input type="checkbox" disabled={exporting} checked={ackExport} onChange={e=>setAckExport(e.target.checked)}/><span>Saya sudah meninjau peringatan dan tetap ingin mengekspor versi ini.</span></label>}</>}
+            </div>
             <div className="export-list">
               <label className="export-option">
-                <input type="checkbox" checked={exportPng} onChange={(e) => setExportPng(e.target.checked)} />
+                <input type="checkbox" disabled={exporting} checked={exportPng} onChange={(e) => setExportPng(e.target.checked)} />
                 <span className="info">
                   <strong>PNG per slide</strong>
                   <small>
-                    {deck.slides.length} gambar · {size.w} × {size.h}
+                    {deck.slides.filter(s=>!s.hidden).length} gambar · {size.w} × {size.h}
                   </small>
                 </span>
                 <ImageDown size={16} />
               </label>
               <label className="export-option">
-                <input type="checkbox" checked={exportPdf} onChange={(e) => setExportPdf(e.target.checked)} />
+                <input type="checkbox" disabled={exporting} checked={exportPdf} onChange={(e) => setExportPdf(e.target.checked)} />
                 <span className="info">
                   <strong>PDF deck</strong>
                   <small>Satu halaman per slide</small>
@@ -1301,7 +1746,7 @@ export default function App() {
                 <FileText size={16} />
               </label>
               <label className="export-option">
-                <input type="checkbox" checked={exportCaption} onChange={(e) => setExportCaption(e.target.checked)} />
+                <input type="checkbox" disabled={exporting} checked={exportCaption} onChange={(e) => setExportCaption(e.target.checked)} />
                 <span className="info">
                   <strong>Caption & catatan</strong>
                   <small>File teks pendamping</small>
@@ -1310,16 +1755,16 @@ export default function App() {
               </label>
             </div>
             <div className="modal-actions">
-              <button className="btn btn-ghost btn-sm" onClick={() => setExportOpen(false)}>
+              <button className="btn btn-ghost btn-sm" disabled={exporting} onClick={closeExport}>
                 Batal
               </button>
               <button
                 className="btn btn-primary btn-sm"
-                disabled={exporting || (!exportPng && !exportPdf && !exportCaption)}
+                disabled={busy||exporting||checkingExport||!preflight||preflight.revision!==exportRevision(deck)||preflight.findings.some(f=>f.severity==="block")||(preflight.findings.length>0&&!ackExport)||(!exportPng && !exportPdf && !exportCaption)}
                 onClick={() => void runExport()}
               >
                 {exporting ? <Loader2 size={13} className="spin" /> : <Download size={13} />}
-                {exporting ? "Merender…" : "Export"}
+                {exporting ? "Merender…" : "Ekspor"}
               </button>
             </div>
           </div>
@@ -1332,7 +1777,7 @@ export default function App() {
           <span>{toast.text}</span>
         </div>
       )}
-    </div>
+    </div></>
   );
 }
 
@@ -1361,11 +1806,11 @@ function Thumb({
 }) {
   const [over, setOver] = useState(false);
   const size = aspectSize(deck.aspect);
-  const width = 62;
+  const width = 46;
   const height = Math.round((width * size.h) / size.w);
   return (
     <button
-      className={`thumb ${active ? "active" : ""} ${over ? "over" : ""}`}
+      className={`thumb ${slide.hidden?"thumb-hidden":""} ${active ? "active" : ""} ${over ? "over" : ""}`}
       draggable
       onClick={onSelect}
       onDragStart={(e) => {
@@ -1388,11 +1833,11 @@ function Thumb({
         e.preventDefault();
         onMove(e.shiftKey ? -1 : 1);
       }}
-      title={`${slide.title} — geser untuk ubah urutan`}
+      title={`${slide.title}${slide.hidden?" (tidak diekspor)":""} - geser untuk ubah urutan`}
     >
       <span className="thumb-frame" style={{ height }}>
-        <iframe title={`thumb-${index}`} sandbox="allow-same-origin" srcDoc={safeDoc(slide.html, size.w, size.h)} />
-        <span className="thumb-num">{index + 1}</span>
+        <iframe title={`thumb-${index}`} sandbox="allow-same-origin" srcDoc={safeDoc(slide.html, size.w, size.h)} style={{width:size.w,height:size.h,transform:`scale(${width / size.w})`,transformOrigin:"top left"}} />
+        <span className="thumb-num">{index + 1}</span>{slide.hidden&&<span className="thumb-hidden-badge" aria-label="Slide tersembunyi"><EyeOff size={12}/></span>}
         {issues && issues.length > 0 && (
           <span
             className={`thumb-lint ${issues.some((i) => i.severity === "error") ? "bad" : ""}`}
@@ -1402,7 +1847,7 @@ function Thumb({
           </span>
         )}
       </span>
-      <span className="thumb-title">{slide.title || "Slide"}</span>
+      <span className="thumb-title">{slide.hidden?"Tersembunyi · ":""}{slide.title || "Slide"}</span>
     </button>
   );
 }
@@ -1416,71 +1861,149 @@ function SettingsModal({
   onClose: () => void;
   onSave: (patch: Partial<ReturnType<typeof useStudio.getState>["settings"]>) => Promise<void>;
 }) {
-  const [form, setForm] = useState(settings);
+  const [form, setForm] = useState(()=>({...settings,activeConnection:settings.activeConnection||crypto.randomUUID()}));
+  const [saving,setSaving]=useState(false);
+  const savingRef=useRef(false);
+  const runtimeBusyRef=useRef(false);
+  const storeBusyRef=useRef(false);
+  const [storeBusy,setStoreBusy]=useState(false);
+  const closeSettings=()=>{if(!savingRef.current&&!runtimeBusyRef.current&&!storeBusyRef.current)onClose()};
+  const settingsDialog=useDialogFocus(closeSettings);
   const [showKey, setShowKey] = useState(false);
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<import("./lib/types").ModelCapability[]>(settings.modelCapabilities ?? []);
+  const [modelError,setModelError]=useState("");
+  const [modelsBusy,setModelsBusy]=useState(false);
+  const capability=models.find(m=>m.id===form.model && m.source.replace(/\/+$/, "")===form.baseUrl.replace(/\/+$/, ""));
+  const [connectionName,setConnectionName]=useState("");
+  const [searchModels,setSearchModels]=useState("");
+  const [managerError,setManagerError]=useState("");
+  const [runtime,setRuntime]=useState<{running:boolean;gatewayUrl?:string;version:string;managed:boolean}|null>(null);
+  const [runtimeBusy,setRuntimeBusy]=useState(false);
+  const [runtimeFailed,setRuntimeFailed]=useState(false);
+  const [nativeManager,setNativeManager]=useState(true);
+ const [settingsSection,setSettingsSection]=useState<"model"|"connect">("model");
+  useEffect(()=>{void api.runtimeStatus().then(r=>{setRuntime(r);setRuntimeFailed(false);}).catch(e=>{setManagerError(String(e));setRuntimeFailed(true);});},[]);
+  const isManaged=form.providerKind==="magpie-managed";
+  const isMagpie=isManaged||form.providerKind==="magpie";
+  const tokenCount=(n?:number)=>n ? n.toLocaleString("en-US")+" token" : "Belum diketahui";
+  const snapshot=()=>({id:form.activeConnection||crypto.randomUUID(),name:connectionName.trim()||form.connections?.find(c=>c.id===form.activeConnection)?.name||(isMagpie?"Magpie lokal":"Koneksi API"),kind:form.providerKind||"openai-compatible",baseUrl:form.baseUrl,apiKey:form.apiKey,model:form.model,reasoningEffort:form.reasoningEffort,modelCapabilities:models.filter(m=>m.source===form.baseUrl)});
+  const remember=()=>{const c=snapshot();return {...form,activeConnection:c.id,connections:[...(form.connections??[]).filter(x=>x.id!==c.id),c],modelCapabilities:c.modelCapabilities};};
+  const switchConnection=(id:string)=>{const saved=remember();const c=saved.connections.find(x=>x.id===id);if(!c)return;setForm({...saved,activeConnection:c.id,providerKind:c.kind,baseUrl:c.baseUrl,apiKey:c.apiKey,model:c.model,reasoningEffort:c.reasoningEffort??"auto",modelCapabilities:c.modelCapabilities??[]});setModels(c.modelCapabilities??[]);setConnectionName(c.name);setTest("idle");setTestMsg("");setModelError("");};
+  const newConnection=(baseUrl:string,model:string,kind="openai-compatible",name="Koneksi API")=>{const saved=remember();setForm({...saved,activeConnection:crypto.randomUUID(),providerKind:kind,baseUrl,apiKey:"",model,reasoningEffort:"auto",modelCapabilities:[]});setModels([]);setConnectionName(name);setTest("idle");setTestMsg("");setModelError("");};
+  const startRuntime=async(manage=false)=>{if(runtimeBusyRef.current||savingRef.current)return;runtimeBusyRef.current=true;try{setRuntimeBusy(true);setManagerError("");const r=await api.runtimeStart();setRuntime(r);if(r.gatewayUrl){if(form.baseUrl!==r.gatewayUrl){setModels([]);patch({baseUrl:r.gatewayUrl,apiKey:"",reasoningEffort:"auto",modelCapabilities:[]});}}if(manage){setNativeManager(true);setSettingsSection("connect");}}catch(e){setManagerError(String(e));}finally{runtimeBusyRef.current=false;setRuntimeBusy(false);}};
+  const stopRuntime=async()=>{if(runtimeBusyRef.current||savingRef.current)return;runtimeBusyRef.current=true;setRuntimeBusy(true);setManagerError("");try{await api.runtimeStop();setRuntime(await api.runtimeStatus());}catch(e){setManagerError(String(e));}finally{runtimeBusyRef.current=false;setRuntimeBusy(false)}};
+  const discoveryTarget=useRef("");
+  discoveryTarget.current=[form.activeConnection,form.baseUrl,form.apiKey,form.providerKind,form.model].join("|");
   const [test, setTest] = useState<"idle" | "busy" | "ok" | "bad">("idle");
   const [testMsg, setTestMsg] = useState("");
+  const testBusyRef = useRef(false);
 
-  const patch = (p: Partial<typeof form>) => setForm((f) => ({ ...f, ...p }));
+  const patch = (p: Partial<typeof form>) => {if(["baseUrl","apiKey","model","providerKind"].some(k=>k in p)){setTest("idle");setTestMsg("");}setForm((f) => ({ ...f, ...p }));};
 
   const loadModels = async () => {
+    const target=discoveryTarget.current;
     try {
-      setModels(await api.listModels());
-    } catch {
-      setModels([]);
-    }
+      setModelsBusy(true);setModelError("");
+      const discovered=await api.discoverModels(form);
+      if(target!==discoveryTarget.current)return;setModels(discovered);patch({...(isManaged&&discovered[0]?{baseUrl:discovered[0].source}:{}),modelCapabilities:discovered,reasoningEffort:"auto",...(form.model?{}:{model:discovered[0]?.id??""})});
+    } catch (e) {
+      if(target!==discoveryTarget.current)return;
+      setModelError(String(e));
+    } finally {setModelsBusy(false);}
   };
 
   const runTest = async () => {
+    if(testBusyRef.current)return;
+    testBusyRef.current=true;
+    const target=discoveryTarget.current;
     setTest("busy");
     setTestMsg("");
     try {
-      const res = (await api.testConnection()) as { provider?: string; model?: string };
+      const res = (await api.testConnection(form)) as { provider?: string; model?: string };
+      if(target!==discoveryTarget.current)return;
       setTest("ok");
       setTestMsg(`${res.provider ?? "Provider"} · ${res.model ?? form.model}`);
     } catch (err) {
+      if(target!==discoveryTarget.current)return;
       setTest("bad");
       setTestMsg(String(err).slice(0, 160));
-    }
+    } finally {testBusyRef.current=false;}
+  };
+
+  // One-click diagnostics, redacted by default: version, whitelisted provider
+  // path facts, runtime status and counts. Freeform user text (endpoint, model
+  // id, connection names, project titles/content, chat) is never included -
+  // custom endpoints can embed credentials or private hosts, and model ids are
+  // arbitrary user text, so only their configured/not-configured state is copied.
+  const copyDiagnostics=async()=>{
+    const s=useStudio.getState();
+    const knownKind=["openai-compatible","magpie","magpie-managed"].includes(form.providerKind||"")?form.providerKind:"tidak dikenal (tidak disertakan)";
+    const endpoint=!form.baseUrl?"belum diisi":PROVIDERS.some(p=>p.baseUrl.replace(/\/+$/,"")===(form.baseUrl||"").replace(/\/+$/,""))?"preset bawaan (tanpa detail)":"kustom (tidak disertakan)";
+    const runtimeVersion=runtime&&/^[\d.]+$/.test(runtime.version)?` · v${runtime.version}`:"";
+    const lines=[
+      `Desel ${pkg.version} · ${api.isTauri?"desktop":"browser"}`,
+      `Provider: ${knownKind}`,
+      `Endpoint: ${endpoint}`,
+      `Model: ${form.model?"dipilih (tidak disertakan)":"belum dipilih"}`,
+      `API key: ${form.apiKey?"tersimpan (tidak disertakan)":"belum diisi"}`,
+      `Koneksi tersimpan: ${(form.connections??[]).length}`,
+      `Runtime: ${runtimeFailed?"status tidak diketahui":runtime?`${runtime.running?"berjalan":"berhenti"}${runtimeVersion}`:"belum diperiksa"}`,
+      `Proyek: ${s.decks.length} · Template: ${s.templates.length}`,
+      `Status simpan: ${s.saveState}`,
+      "Tidak menyertakan API key, nama koneksi, detail endpoint, nama model, judul/isi proyek, atau isi chat.",
+    ];
+    try{await navigator.clipboard.writeText(lines.join("\n"));s.notify("ok","Info diagnosis disalin tanpa secret.");}catch(e){s.notify("error",`Info diagnosis belum tersalin: ${String(e)}`);}
   };
 
   return (
-    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal wide">
+    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && closeSettings()}>
+      <div className="modal wide" ref={settingsDialog} role="dialog" aria-modal="true" aria-label="Pengaturan workspace">
         <div className="modal-head">
           <h2>Pengaturan</h2>
-          <button className="icon-btn" onClick={onClose}>
+          <button className="icon-btn" disabled={saving||runtimeBusy||storeBusy} onClick={closeSettings}>
             <X size={15} />
           </button>
         </div>
-        <p className="modal-sub">Tersimpan di database lokal aplikasi — tetap ada setelah app ditutup.</p>
+        <fieldset disabled={saving||runtimeBusy||storeBusy} style={{display:"contents"}}><div className="presets"><button className={`chip ${settingsSection==="model"?"on":""}`} onClick={()=>setSettingsSection("model")}>Model & workspace</button><button className={`chip ${settingsSection==="connect"?"on":""}`} onClick={()=>setSettingsSection("connect")}>Provider & Plugin Store</button></div>{settingsSection==="connect"?<ProviderManager onBusyChange={value=>{storeBusyRef.current=value;setStoreBusy(value)}}/>:<>
+        <p className="modal-sub">Koneksi tersimpan di database lokal, termasuk API key. Jangan bagikan database aplikasi.</p>
+        <div className="provider-workspace">
+          <div className="connection-heading"><span>Koneksi tersimpan</span><button className="btn btn-ghost btn-tiny" onClick={()=>newConnection("https://api.openai.com/v1","","openai-compatible","Koneksi baru")}>+ Koneksi</button></div>
+          <div className="connection-list">{(form.connections??[]).map(c=><button key={c.id} className={`connection-item ${form.activeConnection===c.id?"selected":""}`} onClick={()=>switchConnection(c.id)}><span>{c.name}</span><small>{c.kind==="magpie-managed"?"Provider bawaan":c.kind==="magpie"?"Magpie eksternal":"API compatible"} · {c.model||"Belum pilih model"}</small></button>)}{!(form.connections?.length)&&<small>Koneksi sekarang akan disimpan saat lo klik Simpan.</small>}</div>
+          {form.activeConnection&&form.connections?.some(c=>c.id===form.activeConnection)&&<button className="btn btn-ghost btn-tiny" onClick={()=>{const next=(form.connections??[]).filter(c=>c.id!==form.activeConnection);const c=next[0];setForm({...form,connections:next,activeConnection:c?.id??crypto.randomUUID(),providerKind:c?.kind??"openai-compatible",baseUrl:c?.baseUrl??"https://api.openai.com/v1",apiKey:c?.apiKey??"",model:c?.model??"",modelCapabilities:c?.modelCapabilities??[],reasoningEffort:c?.reasoningEffort??"auto"});setModels(c?.modelCapabilities??[]);setConnectionName(c?.name??"");setTest("idle");setTestMsg("");}}>Hapus koneksi ini dari Desel</button>}
+          <label className="field"><span>Nama koneksi</span><input value={connectionName||form.connections?.find(c=>c.id===form.activeConnection)?.name||""} placeholder={isMagpie?"Magpie lokal":"API utama"} onChange={e=>setConnectionName(e.target.value)}/></label>
+        </div>
 
         <div className="presets">
           {PROVIDERS.map((p) => (
             <button
               key={p.label}
               className={`chip ${form.baseUrl.replace(/\/+$/, "") === p.baseUrl ? "on" : ""}`}
-              onClick={() => patch({ baseUrl: p.baseUrl, model: form.model.trim() || p.model })}
+              onClick={() => newConnection(p.baseUrl,p.model,"kind" in p?String(p.kind):"openai-compatible",p.label)}
             >
               {p.label}
             </button>
           ))}
         </div>
 
+        <label className="field"><span>Jalur koneksi</span><select value={form.providerKind||"openai-compatible"} onChange={e=>{setModels([]);patch({providerKind:e.target.value,apiKey:"",modelCapabilities:[],reasoningEffort:"auto"});}}><option value="openai-compatible">API OpenAI-compatible</option><option value="magpie-managed">Provider bawaan Desel</option><option value="magpie">Magpie eksternal (advanced)</option></select></label>
+        {isMagpie&&<div className="gateway-guide"><strong>{isManaged?"Provider bawaan Desel":"Gateway Magpie eksternal"}</strong><p>{isManaged?"Runtime otomatis, tanpa instalasi terpisah. Kelola provider di Desel.":"Advanced: sambungkan gateway yang lo jalankan sendiri. Provider dan login dikelola oleh runtime eksternal itu."}</p>
+        {isManaged&&<><div className="connection-heading"><span>{runtimeFailed?"Status runtime tidak diketahui":runtime?.running?"Runtime berjalan":"Runtime belum dimulai"}{runtimeFailed?"":` · v${runtime?.version||"0.1.1404"}`}</span></div><div style={{display:"flex",gap:8,flexWrap:"wrap"}}><button className="btn btn-primary btn-sm" disabled={runtimeBusy} onClick={()=>void startRuntime(true)}>{runtimeBusy?"Memproses runtime…":"Kelola provider & login"}</button><button className="btn btn-ghost btn-sm" disabled={runtimeBusy} onClick={()=>void startRuntime()}>Hubungkan runtime</button>{runtime?.running&&<button className="btn btn-ghost btn-sm" disabled={runtimeBusy} onClick={()=>void stopRuntime()}>Hentikan runtime</button>}</div></>}
+        <details><summary>Privasi, plugin, dan keamanan</summary><small>Data runtime disimpan terpisah di folder aplikasi Desel. Pencarian login aplikasi lain dan telemetry dimatikan saat awal. Plugin dapat mengakses proses, file, dan kredensial; pasang hanya yang dipercaya. Login bisa membuka halaman OAuth resmi vendor lalu kembali ke Desel. Tidak ada langganan atau topup otomatis.</small></details>{managerError&&<small className="model-error">{managerError}</small>}</div>}
+
+        {isManaged?<details><summary>Detail koneksi lokal (otomatis)</summary><small>Alamat runtime ditetapkan Desel saat mulai. Tidak perlu mengisi server atau key.</small><code>{runtime?.gatewayUrl||"Runtime akan dimulai saat dibutuhkan"}</code></details>:<>
         <label className="field">
-          <span>Base URL (OpenAI-compatible)</span>
-          <input value={form.baseUrl} onChange={(e) => patch({ baseUrl: e.target.value })} placeholder="https://api.openai.com/v1" />
+          <span>{isMagpie?"Alamat gateway Magpie":"Base URL (OpenAI-compatible)"}</span>
+          <input readOnly={isManaged} value={form.baseUrl} onChange={(e) => {setModels([]);setModelError("");patch({ baseUrl: e.target.value,apiKey:"",modelCapabilities:[],reasoningEffort:"auto" });}} placeholder="https://api.openai.com/v1" />
         </label>
 
         <label className="field">
-          <span>API key</span>
+          <span>{isMagpie?"Gateway key (loopback bawaan tidak perlu key)":"API key"}</span>
           <div className="inline-input">
             <input
               type={showKey ? "text" : "password"}
-              value={form.apiKey}
-              onChange={(e) => patch({ apiKey: e.target.value })}
-              placeholder="sk-…"
+              readOnly={isManaged} value={form.apiKey}
+              onChange={(e) => {setModels([]);patch({ apiKey: e.target.value,modelCapabilities:[],reasoningEffort:"auto" });}}
+              placeholder={isMagpie?"Kosong jika gateway lokal tidak meminta key":"sk-…"}
             />
             <button onClick={() => setShowKey((v) => !v)} title={showKey ? "Sembunyikan" : "Tampilkan"}>
               {showKey ? <EyeOff size={13} /> : <Eye size={13} />}
@@ -1488,18 +2011,20 @@ function SettingsModal({
           </div>
         </label>
 
+        </>}
+        {modelError && <p className="model-error">{modelError}</p>}
         <div className="field-row">
           <label className="field">
             <span>Model</span>
             <div className="inline-input">
-              <input value={form.model} onChange={(e) => patch({ model: e.target.value })} list="model-list" placeholder="gpt-4o-mini" />
-              <button title="Ambil daftar model" onClick={() => void loadModels()}>
+              <input value={form.model} onChange={(e) => patch({ model: e.target.value,reasoningEffort:"auto" })} list="model-list" placeholder="gpt-4o-mini" />
+              <button disabled={modelsBusy} title="Ambil daftar model dari Base URL di form ini (tanpa inferensi)" onClick={() => void loadModels()}>
                 <RefreshCw size={12} />
               </button>
             </div>
             <datalist id="model-list">
               {models.map((m) => (
-                <option key={m} value={m} />
+                <option key={m.id} value={m.id} />
               ))}
             </datalist>
           </label>
@@ -1517,13 +2042,17 @@ function SettingsModal({
           </label>
         </div>
 
+        <div className="model-picker"><div className="connection-heading"><span>{modelError?(models.length?"Discovery model gagal - daftar sebelumnya tetap ditampilkan":"Discovery model gagal"):`${models.length} model dari koneksi ini`}</span><small>Discovery tanpa inferensi</small></div><input aria-label="Cari model" placeholder="Cari model atau provider…" value={searchModels} onChange={e=>setSearchModels(e.target.value)}/><div className="model-results">{models.filter(m=>m.source===form.baseUrl&&(m.id+" "+(m.name??"")+" "+(m.provider??"")).toLowerCase().includes(searchModels.toLowerCase())).map(m=><button className={`model-choice ${form.model===m.id?"selected":""}`} key={m.id} onClick={()=>patch({model:m.id,reasoningEffort:"auto"})}><span>{m.name||m.id}</span><code>{m.id}</code><small>{m.contextWindow?tokenCount(m.contextWindow)+" input":"Context belum diketahui"} · {m.efforts.length?m.efforts.join(" / "):"Effort tidak tersedia"}</small></button>)}</div></div>
+        <div className="capability-grid"><div><small>Context / input limit</small><strong>{tokenCount(capability?.contextWindow)}</strong></div><div><small>Output maksimum</small><strong>{tokenCount(capability?.maxOutput)}</strong></div><div><small>Input</small><strong>{capability?.inputModalities.length?capability.inputModalities.join(", "):"Belum diketahui"}</strong></div><div><small>Asal metadata</small><strong>{capability?(isMagpie?"Dilaporkan Magpie":"Endpoint provider"):"Belum diambil"}</strong></div></div>
+        <p className="metadata-note">{capability?(isMagpie?"Magpie dapat memakai data provider, katalog, cache, atau plugin. Sumber tiap field tidak diekspos; bukan hasil pengujian kapasitas Desel.":"Batas dilaporkan endpoint, belum diuji dengan inferensi."):"Ambil daftar model untuk mengisi kemampuan. Model manual tetap bisa dipakai; context dan effort tidak ditebak."}{capability?.discoveredAt&&` Diambil ${new Date(capability.discoveredAt).toLocaleString("id-ID")}.`}</p>
+        <label className="field"><span>Thinking effort</span><select value={form.reasoningEffort ?? "auto"} onChange={e=>patch({reasoningEffort:e.target.value})}><option value="auto">Auto - default provider</option>{capability?.efforts.map(level=><option key={level} value={level}>{level}</option>)}</select><small>{capability?.efforts.length?`Level untuk model ini: ${capability.efforts.join(", ")}. Effort lebih tinggi bisa lebih lama dan mahal.`:"Tidak ada level yang dilaporkan. Auto tidak mengirim parameter effort."}</small></label>
         <div className="field-row">
           <label className="field">
             <span>Brand handle</span>
             <input value={form.brandHandle} onChange={(e) => patch({ brandHandle: e.target.value })} placeholder="@brand" />
           </label>
           <label className="field">
-            <span>Folder export</span>
+            <span>Folder ekspor</span>
             <input value={form.exportDir ?? ""} onChange={(e) => patch({ exportDir: e.target.value || null })} placeholder="Default: Pictures/Desel" />
           </label>
         </div>
@@ -1546,9 +2075,9 @@ function SettingsModal({
           <label className="check">
             <input type="checkbox" checked={form.sendReferences} onChange={(e) => patch({ sendReferences: e.target.checked })} />
             <span>
-              <strong>Model bisa melihat gambar</strong>
+              <strong>Kirim gambar ke model</strong>
               <small>
-                Kirim gambar referensi apa adanya ke model (butuh model vision: GPT-4o, Claude, Gemini, Qwen-VL).
+                Aktifkan hanya untuk model yang mendukung gambar. Termasuk referensi dan pemeriksaan render slide; dukungan belum diketahui jika metadata tidak tersedia.
                 Kalau mati, agent tetap menerima palet, kontras, dan ukuran tiap referensi dalam bentuk teks.
               </small>
             </span>
@@ -1557,26 +2086,27 @@ function SettingsModal({
 
         <div className={`check-line ${test === "ok" ? "ok" : test === "bad" ? "bad" : ""}`}>
           <span className="dot" />
-          <span>{test === "busy" ? "Menguji koneksi…" : testMsg || "Belum diuji"}</span>
+          <span>{test === "busy" ? "Menguji koneksi…" : testMsg || "Belum diuji. Tes memakai koneksi di form ini dan dapat berbiaya."}</span>
           <button className="btn btn-ghost btn-tiny" style={{ marginLeft: "auto" }} onClick={() => void runTest()} disabled={test === "busy"}>
-            Tes koneksi
+            Tes koneksi (inferensi)
           </button>
         </div>
 
+        </>}
+        <div className="diagnostics-row"><button className="btn btn-ghost btn-sm" disabled={saving||runtimeBusy||storeBusy} onClick={()=>void copyDiagnostics()}>Salin info diagnosis</button><small>Versi, jalur provider, status runtime dan jumlah data. API key, nama koneksi, detail endpoint, nama model, judul/isi proyek dan chat tidak disertakan.</small></div>
         <div className="modal-actions">
-          <button className="btn btn-ghost btn-sm" onClick={onClose}>
-            Batal
+          <button className="btn btn-ghost btn-sm" onClick={closeSettings}>
+            Tutup
           </button>
           <button
             className="btn btn-primary btn-sm"
             onClick={async () => {
-              await onSave(form);
-              onClose();
+              if(savingRef.current||runtimeBusyRef.current||storeBusyRef.current)return;savingRef.current=true;setSaving(true);try{await onSave(remember());onClose();}catch{/* error notice already shown; keep unsaved form open */}finally{savingRef.current=false;setSaving(false)}
             }}
           >
-            <Check size={13} /> Simpan
+            <Check size={13} /> {saving?"Menyimpan...":"Simpan"}
           </button>
-        </div>
+        </div></fieldset>
       </div>
     </div>
   );
@@ -1586,29 +2116,6 @@ function SettingsModal({
 /* helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
-function safeDoc(input: string, width: number, height: number) {
-  let html = (input || "").trim();
-  if (!html) {
-    return `<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0;width:${width}px;height:${height}px;background:#111"></body></html>`;
-  }
-  // Strip anything executable; slides are static design only.
-  html = html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, "")
-    .replace(/<object\b[^>]*>[\s\S]*?<\/object\s*>/gi, "")
-    .replace(/<embed\b[^>]*>/gi, "")
-    .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-    .replace(/javascript\s*:/gi, "")
-    .replace(/<link\b[^>]*>/gi, "");
-
-  if (!/<html[\s>]/i.test(html)) {
-    html = `<!doctype html><html><head><meta charset="utf-8"></head><body>${html}</body></html>`;
-  }
-  // Guarantee the document fills the artboard even if the model forgot.
-  const base = `<style>html,body{margin:0;padding:0;width:${width}px;height:${height}px;overflow:hidden;}*{box-sizing:border-box;}</style>`;
-  html = /<head[^>]*>/i.test(html) ? html.replace(/<head([^>]*)>/i, `<head$1>${base}`) : `${base}${html}`;
-  return html;
-}
 
 function slug(v: string) {
   return (
@@ -1632,6 +2139,7 @@ function when(iso: string) {
 
 function stepLabel(name: string) {
   const map: Record<string, string> = {
+    github_trending:"Membaca GitHub Trending",import_image:"Mengunduh aset sumber",review_render:"Menganalisis render slide",
     search_web: "Mencari referensi & fakta",
     fetch_url: "Membaca sumber",
     read_deck: "Membaca deck",

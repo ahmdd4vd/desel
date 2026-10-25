@@ -28,7 +28,7 @@ pub fn new_id(prefix: &str) -> String {
 ///
 /// Autosave fires while someone types in the code panel, so versions are
 /// throttled to one per slide per editing burst instead of one per keystroke.
-fn capture_revisions(conn: &Connection, old: &Deck, new: &Deck) {
+fn capture_revisions(conn: &Connection, old: &Deck, new: &Deck) -> rusqlite::Result<()> {
     const THROTTLE_SECS: i64 = 25;
     const KEEP: i64 = 24;
 
@@ -43,35 +43,40 @@ fn capture_revisions(conn: &Connection, old: &Deck, new: &Deck) {
             continue;
         }
 
-        let recent: Option<String> = conn
+        let recent: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT created_at FROM slide_revisions WHERE slide_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                "SELECT created_at, html, title FROM slide_revisions WHERE slide_id = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![prev.id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .ok()
             .flatten();
-        if let Some(ts) = recent {
-            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
-                let age = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds();
-                if age < THROTTLE_SECS {
-                    continue;
+        if let Some((ts, last_html, last_title)) = recent {
+            // Coalesce bursts of the SAME content, but never skip a snapshot
+            // whose content differs - e.g. an agent version overwritten by a
+            // user's manual commit seconds later must stay recoverable.
+            if last_html == prev.html && last_title==prev.title {
+                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                    let age = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds();
+                    if age < THROTTLE_SECS {
+                        continue;
+                    }
                 }
             }
         }
 
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO slide_revisions(id, deck_id, slide_id, title, html, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![new_id("rev"), old.id, prev.id, prev.title, prev.html, now()],
-        );
-        let _ = conn.execute(
+        )?;
+        conn.execute(
             "DELETE FROM slide_revisions WHERE slide_id = ?1 AND id NOT IN (
                 SELECT id FROM slide_revisions WHERE slide_id = ?1 ORDER BY created_at DESC LIMIT ?2
              )",
             params![prev.id, KEEP],
-        );
+        )?;
     }
 
     // A slide that no longer exists cannot be restored or annotated, so its
@@ -80,9 +85,10 @@ fn capture_revisions(conn: &Connection, old: &Deck, new: &Deck) {
         if new.slides.iter().any(|s| s.id == gone.id) {
             continue;
         }
-        let _ = conn.execute("DELETE FROM slide_revisions WHERE slide_id = ?1", params![gone.id]);
-        let _ = conn.execute("DELETE FROM comments WHERE slide_id = ?1", params![gone.id]);
+        conn.execute("DELETE FROM slide_revisions WHERE slide_id = ?1", params![gone.id])?;
+        conn.execute("DELETE FROM comments WHERE slide_id = ?1", params![gone.id])?;
     }
+    Ok(())
 }
 
 impl Db {
@@ -104,6 +110,9 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS brand_profiles(id TEXT PRIMARY KEY,doc TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS deck_history (seq INTEGER PRIMARY KEY AUTOINCREMENT,deck_id TEXT NOT NULL,direction TEXT NOT NULL,doc TEXT NOT NULL,comments TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_deck_history ON deck_history(deck_id,direction,seq DESC);
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -119,6 +128,7 @@ impl Db {
                 updated_at  TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS response_outputs(message_id TEXT PRIMARY KEY,deck_id TEXT NOT NULL,scope TEXT NOT NULL,output TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (
                 id          TEXT PRIMARY KEY,
                 deck_id     TEXT NOT NULL,
@@ -175,7 +185,9 @@ impl Db {
             "#,
         )?;
 
+        for column in ["reference_role", "reference_status", "provenance"] {let _=conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),[]);}
         // Older databases predate the profile column.
+        let _=conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT NOT NULL DEFAULT ''",[]);
         let _ = conn.execute(
             "ALTER TABLE assets ADD COLUMN meta TEXT NOT NULL DEFAULT ''",
             [],
@@ -270,26 +282,30 @@ impl Db {
         .and_then(|raw| serde_json::from_str::<Deck>(&raw).ok())
     }
 
-    pub fn save_deck(&self, deck: &Deck, thumbnail: Option<&str>) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+    pub fn save_deck(&self, deck: &Deck, thumbnail: Option<&str>) -> rusqlite::Result<()> {self.save_deck_checked(deck,thumbnail,None)}
+    pub fn save_deck_checked(&self,deck:&Deck,thumbnail:Option<&str>,expected:Option<&Deck>)->rusqlite::Result<()>{
+        let mut guard=self.conn.lock().unwrap();
+        let conn=guard.transaction()?;
+        if let Some(base)=expected{let raw:String=conn.query_row("SELECT doc FROM decks WHERE id=?1",params![deck.id],|r|r.get(0))?;if serde_json::from_str::<serde_json::Value>(&raw).ok()!=serde_json::to_value(base).ok(){return Err(rusqlite::Error::InvalidParameterName("Project changed in another operation; local edits were not overwritten. Reopen the project before saving again.".into()))}}
 
         // Snapshot the previous wording of any slide that is about to change, so a
         // rewrite by the agent can always be undone from the inspector.
-        if let Ok(raw) = conn.query_row(
-            "SELECT doc FROM decks WHERE id = ?1",
-            params![deck.id],
-            |r| r.get::<_, String>(0),
-        ) {
-            if let Ok(old) = serde_json::from_str::<Deck>(&raw) {
-                capture_revisions(&conn, &old, deck);
+        let previous:Option<String>=conn.query_row("SELECT doc FROM decks WHERE id=?1",params![deck.id],|r|r.get(0)).optional()?;
+        if let Some(raw)=previous {
+            let old:Deck=serde_json::from_str(&raw).map_err(|_|rusqlite::Error::InvalidParameterName("Saved project is damaged; original record was not changed".into()))?;
+            if old.id!=deck.id{return Err(rusqlite::Error::InvalidParameterName("Saved project identity mismatch; original record was not changed".into()))}
+            if serde_json::to_value(&old).ok()!=serde_json::to_value(deck).ok(){
+                push_deck_history(&conn,&old,"undo")?;
+                conn.execute("DELETE FROM deck_history WHERE deck_id=?1 AND direction='redo'",params![deck.id])?;
             }
+            capture_revisions(&conn,&old,deck)?;
         }
 
         let raw = serde_json::to_string(deck).unwrap_or_default();
         let stamp = now();
         conn.execute(
             "INSERT INTO decks(id, title, aspect, doc, thumbnail, created_at, updated_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                aspect = excluded.aspect,
@@ -303,12 +319,14 @@ impl Db {
                 raw,
                 thumbnail,
                 if deck.created_at.is_empty() {
-                    stamp
+                    stamp.clone()
                 } else {
                     deck.created_at.clone()
-                }
+                },
+                stamp
             ],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -359,13 +377,15 @@ impl Db {
     }
 
     pub fn delete_deck(&self, id: &str) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut guard=self.conn.lock().unwrap();let conn=guard.transaction()?;
+        conn.execute("DELETE FROM deck_history WHERE deck_id=?1",params![id])?;
         conn.execute("DELETE FROM decks WHERE id = ?1", params![id])?;
+        conn.execute("DELETE FROM response_outputs WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM messages WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM comments WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM assets WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM slide_revisions WHERE deck_id = ?1", params![id])?;
-        Ok(())
+        conn.commit()?;Ok(())
     }
 
     /* ---------------------------------------------------------------- */
@@ -380,8 +400,8 @@ impl Db {
             .and_then(|p| serde_json::to_string(p).ok())
             .unwrap_or_default();
         conn.execute(
-            "INSERT INTO assets (id, deck_id, name, mime, data, meta, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO assets (id, deck_id, name, mime, data, meta, created_at, reference_role, reference_status, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 asset.id,
                 asset.deck_id,
@@ -389,7 +409,7 @@ impl Db {
                 asset.mime,
                 asset.data,
                 meta,
-                asset.created_at
+                asset.created_at, asset.reference_role, asset.reference_status, serde_json::to_string(&asset.provenance).unwrap_or_default()
             ],
         )?;
         Ok(())
@@ -399,7 +419,7 @@ impl Db {
     pub fn list_assets(&self, deck_id: &str) -> Vec<Asset> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, deck_id, name, mime, data, meta, created_at
+            "SELECT id, deck_id, name, mime, data, meta, created_at, reference_role, reference_status, provenance
              FROM assets WHERE deck_id = ?1 ORDER BY created_at ASC",
         ) {
             Ok(s) => s,
@@ -407,7 +427,7 @@ impl Db {
         };
         let rows = match stmt.query_map(params![deck_id], |r| {
             let meta: String = r.get(5)?;
-            Ok(Asset {
+            Ok(Asset {provenance:serde_json::from_str(&r.get::<_,String>(9)?).unwrap_or(None),reference_role:r.get(7)?,reference_status:r.get(8)?,
                 id: r.get(0)?,
                 deck_id: r.get(1)?,
                 name: r.get(2)?,
@@ -421,6 +441,12 @@ impl Db {
             Err(_) => return Vec::new(),
         };
         rows.filter_map(Result::ok).collect()
+    }
+
+    pub fn set_reference_intent(&self, deck_id:&str,id:&str,role:&str,status:&str)->Result<(),String>{
+        if !["", "cover","body","closer","asset"].contains(&role) || !["", "candidate","approved","rejected"].contains(&status){return Err("invalid reference role or status".into())}
+        let count=self.conn.lock().unwrap().execute("UPDATE assets SET reference_role=?1,reference_status=?2 WHERE id=?3 AND deck_id=?4",params![role,status,id,deck_id]).map_err(|e|e.to_string())?;
+        if count!=1{return Err("reference not found in this deck".into())}Ok(())
     }
 
     /// Metadata only — used by the UI so it never has to hold megabytes of base64.
@@ -444,10 +470,12 @@ impl Db {
     /* messages                                                          */
     /* ---------------------------------------------------------------- */
 
+    pub fn save_response_output(&self,message_id:&str,deck_id:&str,scope:&str,output:&serde_json::Value)->Result<(),String>{let json=serde_json::to_string(output).map_err(|e|e.to_string())?;if json.len()>4*1024*1024||!output.is_array(){return Err("Invalid or oversized response continuity".into())}self.conn.lock().unwrap().execute("INSERT OR REPLACE INTO response_outputs(message_id,deck_id,scope,output) VALUES(?1,?2,?3,?4)",params![message_id,deck_id,scope,json]).map_err(|e|e.to_string())?;Ok(())}
+    pub fn response_outputs(&self,deck_id:&str,scope:&str)->std::collections::HashMap<String,serde_json::Value>{let conn=self.conn.lock().unwrap();let mut out=std::collections::HashMap::new();if let Ok(mut statement)=conn.prepare("SELECT message_id,output FROM response_outputs WHERE deck_id=?1 AND scope=?2"){if let Ok(rows)=statement.query_map(params![deck_id,scope],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))){for row in rows.flatten(){if let Ok(v)=serde_json::from_str(&row.1){out.insert(row.0,v);}}}}out}
     pub fn list_messages(&self, deck_id: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, deck_id, role, content, tool_calls, tool_call_id, created_at
+            "SELECT id, deck_id, role, content, tool_calls, tool_call_id, created_at, reasoning_content
              FROM messages WHERE deck_id = ?1 ORDER BY created_at ASC",
         ) {
             Ok(s) => s,
@@ -461,7 +489,7 @@ impl Db {
                 role: r.get(2)?,
                 content: r.get(3)?,
                 tool_calls: serde_json::from_str(&tool_calls_raw).unwrap_or_default(),
-                tool_call_id: r.get(5)?,
+                tool_call_id: r.get(5)?, reasoning_content: r.get(7)?,
                 streaming: false,
                 created_at: r.get(6)?,
             })
@@ -477,8 +505,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let tool_calls = serde_json::to_string(&msg.tool_calls).unwrap_or_else(|_| "[]".into());
         conn.execute(
-            "INSERT INTO messages(id, deck_id, role, content, tool_calls, tool_call_id, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages(id, deck_id, role, content, tool_calls, tool_call_id, created_at,reasoning_content)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7,?8)",
             params![
                 msg.id,
                 msg.deck_id,
@@ -490,7 +518,8 @@ impl Db {
                     now()
                 } else {
                     msg.created_at.clone()
-                }
+                },
+                msg.reasoning_content
             ],
         )?;
         Ok(())
@@ -498,6 +527,7 @@ impl Db {
 
     pub fn clear_messages(&self, deck_id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM response_outputs WHERE deck_id = ?1", params![deck_id])?;
         conn.execute("DELETE FROM messages WHERE deck_id = ?1", params![deck_id])?;
         Ok(())
     }
@@ -760,13 +790,20 @@ mod tests {
         let mut deck = sample_deck("deck_flood");
         db.save_deck(&deck, None).unwrap();
 
+        // Distinct overwritten versions stay recoverable even in a fast burst
+        // (e.g. an agent version overwritten by a manual commit seconds later).
         for i in 0..5 {
             deck.slides[0].html = format!("<!doctype html><html><body>edit {i}</body></html>");
             db.save_deck(&deck, None).unwrap();
         }
+        let revs = db.list_revisions("s1", 12);
+        assert_eq!(revs.len(), 5, "every distinct overwritten version kept: {revs:?}");
+        assert!(revs.iter().any(|r| r.html.contains("edit 3")));
 
-        // One snapshot per editing burst, not one per keystroke.
-        assert_eq!(db.list_revisions("s1", 12).len(), 1);
+        // Re-saving identical content inside the burst window coalesces.
+        deck.slides[0].html = "<!doctype html><html><body>edit 4</body></html>".into();
+        db.save_deck(&deck, None).unwrap();
+        assert_eq!(db.list_revisions("s1", 12).len(), 5, "identical re-save adds nothing");
 
         let _ = std::fs::remove_file(path);
     }
@@ -804,7 +841,7 @@ mod tests {
             role: "user".into(),
             content: "halo".into(),
             tool_calls: Vec::new(),
-            tool_call_id: None,
+            tool_call_id: None, reasoning_content: String::new(),
             streaming: false,
             created_at: String::new(),
         };
@@ -878,7 +915,7 @@ mod tests {
 
         // Opening must add the missing column instead of failing.
         let db = Db::open(path.clone()).expect("db lama tetap bisa dibuka");
-        db.add_asset(&Asset {
+        db.add_asset(&Asset {provenance:None,reference_role:String::new(),reference_status:String::new(),
             id: "ref_old".into(),
             deck_id: Some("deck_1".into()),
             name: "cover.jpg".into(),
@@ -902,4 +939,159 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
     }
+}
+
+#[cfg(test)]mod reference_intent_tests{use super::*;
+#[test]fn reference_intent_roundtrips_and_is_deck_scoped(){let p=std::env::temp_dir().join(format!("intent-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();let a=Asset{id:"a".into(),deck_id:Some("d".into()),name:"plain.jpg".into(),mime:"image/jpeg".into(),data:"AAAA".into(),profile:None,provenance:None,reference_role:String::new(),reference_status:String::new(),created_at:now()};db.add_asset(&a).unwrap();assert!(db.set_reference_intent("other","a","cover","approved").is_err());assert!(db.set_reference_intent("d","a","bad","approved").is_err());db.set_reference_intent("d","a","cover","approved").unwrap();drop(db);let db=Db::open(p.clone()).unwrap();let a=&db.list_assets("d")[0];assert_eq!(a.reference_role,"cover");assert_eq!(a.reference_status,"approved");assert_eq!(a.data,"AAAA");drop(db);let _=std::fs::remove_file(p);}}
+
+impl Db {
+ /// Atomic target-only CAS. Unrelated concurrent deck/slide edits survive.
+ pub fn commit_slide_candidate(&self,base:&Deck,index:usize,candidate:&Slide)->Result<Deck,String>{
+  let mut conn=self.conn.lock().unwrap();let tx=conn.transaction().map_err(|e|e.to_string())?;
+  let raw:String=tx.query_row("SELECT doc FROM decks WHERE id=?1",params![base.id],|r|r.get(0)).map_err(|e|e.to_string())?;
+  let mut latest:Deck=serde_json::from_str(&raw).map_err(|e|e.to_string())?;let old=base.slides.get(index).ok_or("base target absent")?;
+  if latest.aspect!=base.aspect||latest.slides.get(index).map(|s|serde_json::to_string(s).ok())!=Some(serde_json::to_string(old).ok())||candidate.id!=old.id{return Err("stale target/aspect/order: candidate not committed".into())}
+  let previous=latest.clone();latest.slides[index]=candidate.clone();latest.updated_at=now();push_deck_history(&tx,&previous,"undo").map_err(|e|e.to_string())?;tx.execute("DELETE FROM deck_history WHERE deck_id=?1 AND direction='redo'",params![previous.id]).map_err(|e|e.to_string())?;capture_revisions(&tx,&previous,&latest).map_err(|e|e.to_string())?;
+  let doc=serde_json::to_string(&latest).map_err(|e|e.to_string())?;tx.execute("UPDATE decks SET doc=?1,updated_at=?2 WHERE id=?3",params![doc,latest.updated_at,latest.id]).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;Ok(latest)
+ }
+}
+
+#[cfg(test)]mod candidate_cas_tests{use super::*;use serde_json::json;
+#[test]fn target_cas_preserves_unrelated_edits_and_rejects_races(){let path=std::env::temp_dir().join(format!("candidate-cas-{}.db",new_id("t")));let db=Db::open(path.clone()).unwrap();let base:Deck=serde_json::from_value(json!({"id":"d","slides":[{"id":"a","html":"old"},{"id":"b","html":"other"}]})).unwrap();db.save_deck(&base,None).unwrap();let mut latest=base.clone();latest.title="user title".into();latest.slides[1].html="user other edit".into();db.save_deck(&latest,None).unwrap();let mut candidate=base.slides[0].clone();candidate.html="accepted".into();let saved=db.commit_slide_candidate(&base,0,&candidate).unwrap();assert_eq!(saved.title,"user title");assert_eq!(saved.slides[1].html,"user other edit");assert_eq!(saved.slides[0].html,"accepted");let before=serde_json::to_string(&saved).unwrap();assert!(db.commit_slide_candidate(&base,0,&candidate).is_err());assert_eq!(serde_json::to_string(&db.get_deck("d").unwrap()).unwrap(),before);let mut aspect=saved.clone();aspect.aspect="1:1".into();db.save_deck(&aspect,None).unwrap();assert!(db.commit_slide_candidate(&saved,0,&candidate).is_err());drop(db);let _=std::fs::remove_file(path);}
+}
+
+#[cfg(test)]mod response_storage_tests{use super::*;#[test]fn response_items_survive_reopen_and_scope_isolation(){let path=std::env::temp_dir().join(format!("desel-output-{}.db",uuid::Uuid::new_v4()));let db=Db::open(path.clone()).unwrap();let output=serde_json::json!([{"type":"reasoning","encrypted_content":"opaque-fixture"}]);db.save_response_output("msg","deck","scope-a",&output).unwrap();drop(db);let db=Db::open(path.clone()).unwrap();assert_eq!(db.response_outputs("deck","scope-a")["msg"],output);assert!(db.response_outputs("deck","scope-b").is_empty());assert!(db.response_outputs("other-deck","scope-a").is_empty());drop(db);let _=std::fs::remove_file(path);}}
+
+impl Db{
+ pub fn import_project_atomic(&self,deck:&Deck,assets:&[Asset],comments:&[Comment])->Result<(),String>{let mut conn=self.conn.lock().map_err(|_|"Project database unavailable")?;let tx=conn.transaction().map_err(|_|"Cannot begin project restore")?;let result=(||->rusqlite::Result<()>{tx.execute("INSERT INTO decks(id,title,aspect,doc,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?6)",params![deck.id,deck.title,deck.aspect,serde_json::to_string(deck).unwrap(),deck.created_at,deck.updated_at])?;for a in assets{tx.execute("INSERT INTO assets(id,deck_id,name,mime,data,meta,created_at,reference_role,reference_status,provenance)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![a.id,a.deck_id,a.name,a.mime,a.data,serde_json::to_string(&a.profile).unwrap(),a.created_at,a.reference_role,a.reference_status,serde_json::to_string(&a.provenance).unwrap_or_default()])?;}for c in comments{tx.execute("INSERT INTO comments(id,deck_id,slide_id,x,y,body,author,status,selector,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![c.id,c.deck_id,c.slide_id,c.x,c.y,c.body,c.author,c.status,c.selector,c.created_at])?;}Ok(())})();result.map_err(|_|"Project restore failed; nothing was imported")?;tx.commit().map_err(|_|"Cannot commit restored project")?;Ok(())}
+}
+
+fn history_comments(conn:&Connection,deck_id:&str)->rusqlite::Result<Vec<Comment>>{
+ let mut q=conn.prepare("SELECT id,deck_id,slide_id,x,y,body,author,status,selector,created_at FROM comments WHERE deck_id=?1")?;
+ let rows=q.query_map(params![deck_id],|r|Ok(Comment{id:r.get(0)?,deck_id:r.get(1)?,slide_id:r.get(2)?,x:r.get(3)?,y:r.get(4)?,body:r.get(5)?,author:r.get(6)?,status:r.get(7)?,selector:r.get(8)?,created_at:r.get(9)?}))?;
+ rows.collect()
+}
+fn push_deck_history(conn:&Connection,deck:&Deck,direction:&str)->rusqlite::Result<()>{
+ let comments=history_comments(conn,&deck.id)?;
+ conn.execute("INSERT INTO deck_history(deck_id,direction,doc,comments) VALUES(?1,?2,?3,?4)",params![deck.id,direction,serde_json::to_string(deck).unwrap(),serde_json::to_string(&comments).unwrap()])?;
+ conn.execute("DELETE FROM deck_history WHERE deck_id=?1 AND direction=?2 AND seq NOT IN (SELECT seq FROM deck_history WHERE deck_id=?1 AND direction=?2 ORDER BY seq DESC LIMIT 30)",params![deck.id,direction])?;
+ // Bound large HTML histories as well as entry count (64MiB per project).
+ conn.execute("DELETE FROM deck_history WHERE deck_id=?1 AND seq NOT IN (SELECT seq FROM (SELECT seq,SUM(length(CAST(doc AS BLOB))+length(CAST(comments AS BLOB))) OVER (ORDER BY seq DESC) AS bytes FROM deck_history WHERE deck_id=?1) WHERE bytes<=67108864)",params![deck.id])?;Ok(())
+}
+impl Db{
+ pub fn deck_history_counts(&self,id:&str)->[i64;2]{let c=self.conn.lock().unwrap();["undo","redo"].map(|d|c.query_row("SELECT count(*) FROM deck_history WHERE deck_id=?1 AND direction=?2",params![id,d],|r|r.get(0)).unwrap_or(0))}
+ pub fn step_deck_history(&self,expected:&Deck,direction:&str)->Result<Deck,String>{
+ if !matches!(direction,"undo"|"redo"){return Err("Invalid history direction".into())}
+ let mut c=self.conn.lock().unwrap();let tx=c.transaction().map_err(|e|e.to_string())?;
+ let raw:String=tx.query_row("SELECT doc FROM decks WHERE id=?1",params![expected.id],|r|r.get(0)).map_err(|_|"Project not found")?;
+ let current:Deck=serde_json::from_str(&raw).map_err(|_|"Invalid current project")?;
+ if serde_json::to_value(&current).ok()!=serde_json::to_value(expected).ok(){return Err("Project changed. Refresh before undo/redo; newer edits were kept.".into())}
+ let (seq,doc,pins):(i64,String,String)=tx.query_row("SELECT seq,doc,comments FROM deck_history WHERE deck_id=?1 AND direction=?2 ORDER BY seq DESC LIMIT 1",params![expected.id,direction],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|"No history available")?;
+ let mut restored:Deck=serde_json::from_str(&doc).map_err(|_|"Damaged project history")?;
+ let old_pins:Vec<Comment>=serde_json::from_str(&pins).map_err(|_|"Damaged comment history")?;
+ push_deck_history(&tx,&current,if direction=="undo"{"redo"}else{"undo"}).map_err(|e|e.to_string())?;
+ // Only revive pins on reintroduced slides. Never erase edits to surviving pins.
+ for pin in old_pins{if !current.slides.iter().any(|s|s.id==pin.slide_id)&&restored.slides.iter().any(|s|s.id==pin.slide_id){tx.execute("INSERT OR IGNORE INTO comments(id,deck_id,slide_id,x,y,body,author,status,selector,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![pin.id,pin.deck_id,pin.slide_id,pin.x,pin.y,pin.body,pin.author,pin.status,pin.selector,pin.created_at]).map_err(|e|e.to_string())?;}}
+ capture_revisions(&tx,&current,&restored).map_err(|e|e.to_string())?;
+ restored.updated_at=now();
+ tx.execute("UPDATE decks SET title=?2,aspect=?3,doc=?4,updated_at=?5,thumbnail=NULL WHERE id=?1",params![restored.id,restored.title,restored.aspect,serde_json::to_string(&restored).unwrap(),restored.updated_at]).map_err(|e|e.to_string())?;
+ tx.execute("DELETE FROM deck_history WHERE seq=?1",params![seq]).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;Ok(restored)
+ }
+}
+#[cfg(test)]mod deck_history_tests{use super::*;use serde_json::json;
+#[test]fn structural_undo_redo_survives_reopen_preserves_pins_and_rejects_races(){let path=std::env::temp_dir().join(format!("history-{}.db",new_id("t")));let db=Db::open(path.clone()).unwrap();let mut d:Deck=serde_json::from_value(json!({"id":"d","title":"before","slides":[{"id":"a","html":"A"},{"id":"b","html":"B"}]})).unwrap();db.save_deck(&d,None).unwrap();db.add_comment(&Comment{id:"pin".into(),deck_id:"d".into(),slide_id:"b".into(),x:0.2,y:0.3,body:"keep".into(),author:"user".into(),status:"open".into(),selector:"".into(),created_at:now()}).unwrap();d.slides.pop();d.title="after".into();db.save_deck(&d,None).unwrap();assert_eq!(db.list_comments("d").len(),0);assert!(db.step_deck_history(&serde_json::from_value(json!({"id":"d"})).unwrap(),"undo").is_err());drop(db);let db=Db::open(path.clone()).unwrap();let undone=db.step_deck_history(&d,"undo").unwrap();assert_eq!(undone.slides.len(),2);assert_eq!(undone.title,"before");assert_eq!(db.list_comments("d").len(),1);let redone=db.step_deck_history(&undone,"redo").unwrap();assert_eq!(redone.slides.len(),1);assert!(db.list_comments("d").is_empty());let mut new=redone.clone();new.title="branch".into();db.save_deck(&new,None).unwrap();assert_eq!(db.deck_history_counts("d")[1],0);drop(db);let _=std::fs::remove_file(path);}
+#[test]fn failed_save_rolls_back_history_and_pins(){let db=Db::open(std::env::temp_dir().join(format!("history-fail-{}.db",new_id("t")))).unwrap();let d:Deck=serde_json::from_value(json!({"id":"d","slides":[{"id":"s","html":"old"}]})).unwrap();db.save_deck(&d,None).unwrap();db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_save BEFORE UPDATE ON decks BEGIN SELECT RAISE(ABORT,'forced'); END;").unwrap();let mut next=d.clone();next.slides[0].html="new".into();assert!(db.save_deck(&next,None).is_err());assert_eq!(db.deck_history_counts("d"),[0,0]);assert_eq!(db.get_deck("d").unwrap().slides[0].html,"old");assert!(db.list_revisions("s",10).is_empty());}
+}
+
+impl Db{
+ /// Read deck, assets and pins under one database snapshot. Never silently export empty rows after a query error.
+ pub fn portable_snapshot(&self,id:&str)->Result<(Deck,Vec<Asset>,Vec<Comment>),String>{
+ let mut c=self.conn.lock().unwrap();let tx=c.transaction().map_err(|e|e.to_string())?;
+ let raw:String=tx.query_row("SELECT doc FROM decks WHERE id=?1",params![id],|r|r.get(0)).map_err(|_|"Project not found")?;
+ let deck:Deck=serde_json::from_str(&raw).map_err(|_|"Invalid project data")?;
+ let assets={let mut q=tx.prepare("SELECT id,deck_id,name,mime,data,meta,created_at,reference_role,reference_status,provenance FROM assets WHERE deck_id=?1 ORDER BY created_at ASC").map_err(|e|e.to_string())?;let rows=q.query_map(params![id],|r|{let meta:String=r.get(5)?;Ok(Asset{id:r.get(0)?,deck_id:r.get(1)?,name:r.get(2)?,mime:r.get(3)?,data:r.get(4)?,profile:serde_json::from_str(&meta).ok(),created_at:r.get(6)?,provenance:serde_json::from_str(&r.get::<_,String>(9)?).unwrap_or(None),reference_role:r.get(7)?,reference_status:r.get(8)?})}).map_err(|e|e.to_string())?;rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};
+ let comments=history_comments(&tx,id).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;Ok((deck,assets,comments))
+ }
+}
+#[cfg(test)]mod bounded_history_tests{use super::*;use serde_json::json;
+#[test]fn history_count_bound_and_title_only_revisions(){let path=std::env::temp_dir().join(format!("bounded-{}.db",new_id("t")));let db=Db::open(path.clone()).unwrap();let mut d:Deck=serde_json::from_value(json!({"id":"d","slides":[{"id":"s","html":"same","title":"zero"}]})).unwrap();db.save_deck(&d,None).unwrap();for n in 0..40{d.slides[0].title=format!("title{n}");db.save_deck(&d,None).unwrap();}assert_eq!(db.deck_history_counts("d"),[30,0]);let r=db.list_revisions("s",24);assert_eq!(r.len(),24);assert_eq!(r[0].title,"title38");assert_eq!(db.portable_snapshot("d").unwrap().0.slides[0].title,"title39");assert!(db.portable_snapshot("absent").is_err());drop(db);let _=std::fs::remove_file(path);}
+}
+
+#[cfg(test)]mod checked_save_tests{use super::*;use serde_json::json;
+#[test]fn stale_manual_save_cannot_overwrite_agent_or_unrelated_edits(){let p=std::env::temp_dir().join(format!("checked-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();let base:Deck=serde_json::from_value(json!({"id":"d","slides":[{"id":"s","html":"original"}]})).unwrap();db.save_deck(&base,None).unwrap();let mut agent=base.clone();agent.slides[0].html="agent accepted".into();db.commit_slide_candidate(&base,0,&agent.slides[0]).unwrap();let mut manual=base.clone();manual.title="local unsaved".into();assert!(db.save_deck_checked(&manual,None,Some(&base)).is_err());let current=db.get_deck("d").unwrap();assert_eq!(current.slides[0].html,"agent accepted");assert_eq!(current.title,"");assert_eq!(db.deck_history_counts("d"),[1,0]);let mut fresh=current.clone();fresh.title="explicit fresh edit".into();db.save_deck_checked(&fresh,None,Some(&current)).unwrap();assert_eq!(db.get_deck("d").unwrap().title,"explicit fresh edit");drop(db);let _=std::fs::remove_file(p);}
+}
+
+#[cfg(test)]mod history_byte_tests{use super::*;use serde_json::json;
+#[test]fn byte_budget_prunes_old_rows_and_delete_is_atomic(){let p=std::env::temp_dir().join(format!("history-budget-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();let d:Deck=serde_json::from_value(json!({"id":"d","slides":[]})).unwrap();db.save_deck(&d,None).unwrap();{let conn=db.conn.lock().unwrap();for _ in 0..2{conn.execute("INSERT INTO deck_history(deck_id,direction,doc,comments) VALUES('d','undo',zeroblob(35000000),'[]')",[]).unwrap();}push_deck_history(&conn,&d,"undo").unwrap();let size:i64=conn.query_row("SELECT sum(length(doc)+length(comments)) FROM deck_history WHERE deck_id='d'",[],|r|r.get(0)).unwrap();assert!(size<=67108864);conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT,'forced'); END;").unwrap();conn.execute("INSERT INTO messages(id,deck_id,role,content,created_at) VALUES('m','d','user','test','')",[]).unwrap();}assert!(db.delete_deck("d").is_err());assert!(db.get_deck("d").is_some());assert_eq!(db.deck_history_counts("d"),[2,0]);drop(db);let _=std::fs::remove_file(p);}
+}
+
+#[cfg(test)]mod recent_project_tests{use super::*;use serde_json::json;
+#[test]fn saving_old_project_moves_it_to_recent_without_rewriting_creation_time(){let p=std::env::temp_dir().join(format!("recents-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();let mut first:Deck=serde_json::from_value(json!({"id":"first","createdAt":"2000-01-01T00:00:00Z"})).unwrap();let second:Deck=serde_json::from_value(json!({"id":"second","createdAt":"2001-01-01T00:00:00Z"})).unwrap();db.save_deck(&first,None).unwrap();db.save_deck(&second,None).unwrap();first.title="edited old project".into();db.save_deck(&first,None).unwrap();let recent=db.list_decks();assert_eq!(recent[0].id,"first");assert!(recent[0].updated_at>"2020".to_string());assert_eq!(db.get_deck("first").unwrap().created_at,"2000-01-01T00:00:00Z");drop(db);let _=std::fs::remove_file(p);}
+}
+
+impl Db {
+ pub fn set_asset_provenance(&self,deck_id:&str,id:&str,value:&crate::model::AssetProvenance)->Result<(),String>{
+  value.validate()?;let text=serde_json::to_string(value).map_err(|e|e.to_string())?;
+  let count=self.conn.lock().map_err(|_|"Database unavailable")?.execute("UPDATE assets SET provenance=?1 WHERE id=?2 AND deck_id=?3",params![text,id,deck_id]).map_err(|e|e.to_string())?;
+  if count!=1{return Err("Asset not found in this project".into())}Ok(())
+ }
+ pub fn library_assets(&self)->Vec<Asset>{
+  let conn=self.conn.lock().unwrap();let mut q=match conn.prepare("SELECT a.id,a.deck_id,a.name,a.mime,a.meta,a.created_at,a.reference_role,a.reference_status,a.provenance FROM assets a JOIN decks d ON d.id=a.deck_id WHERE a.mime LIKE 'image/%' AND substr(a.name,1,8) != '__render' ORDER BY d.updated_at DESC,a.created_at ASC"){Ok(q)=>q,Err(_)=>return vec![]};
+  let rows=q.query_map([],|r|Ok(Asset{id:r.get(0)?,deck_id:r.get(1)?,name:r.get(2)?,mime:r.get(3)?,data:String::new(),profile:serde_json::from_str(&r.get::<_,String>(4)?).ok(),created_at:r.get(5)?,reference_role:r.get(6)?,reference_status:r.get(7)?,provenance:serde_json::from_str(&r.get::<_,String>(8)?).unwrap_or(None)}));
+  match rows{Ok(r)=>r.filter_map(Result::ok).collect(),Err(_)=>vec![]}
+ }
+ pub fn asset_by_id(&self,deck:&str,id:&str)->Result<Asset,String>{
+  self.conn.lock().map_err(|_|"Database unavailable")?.query_row("SELECT id,deck_id,name,mime,data,meta,created_at,reference_role,reference_status,provenance FROM assets WHERE id=?1 AND deck_id=?2 AND mime LIKE 'image/%'",params![id,deck],|r|Ok(Asset{id:r.get(0)?,deck_id:r.get(1)?,name:r.get(2)?,mime:r.get(3)?,data:r.get(4)?,profile:serde_json::from_str(&r.get::<_,String>(5)?).ok(),created_at:r.get(6)?,reference_role:r.get(7)?,reference_status:r.get(8)?,provenance:serde_json::from_str(&r.get::<_,String>(9)?).unwrap_or(None)})).map_err(|_|"Image not found in this project".into())
+ }
+ pub fn copy_library_asset(&self,target:&str,source_deck:&str,id:&str)->Result<Asset,String>{
+  if self.get_deck(target).is_none(){return Err("Destination project not found".into())}
+  let mut asset=self.asset_by_id(source_deck,id)?;if asset.name.starts_with("__render"){return Err("Internal image is not a library asset".into())}
+  asset.id=new_id("ref");asset.deck_id=Some(target.into());asset.created_at=now();
+  self.add_asset(&asset).map_err(|e|e.to_string())?;Ok(asset)
+ }
+}
+
+#[cfg(test)]mod library_tests{use super::*;use serde_json::json;use crate::model::AssetProvenance;
+fn fixture(db:&Db)->Asset{for id in ["source","target"]{db.save_deck(&serde_json::from_value(json!({"id":id})).unwrap(),None).unwrap();}let a:Asset=serde_json::from_value(json!({"id":"a","deckId":"source","name":"Original","mime":"image/png","data":"AAAA"})).unwrap();db.add_asset(&a).unwrap();a}
+#[test]fn provenance_survives_restart_and_rejects_wrong_scope(){let p=std::env::temp_dir().join(format!("provenance-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();fixture(&db);let note=AssetProvenance{source_url:"https://example.test/image".into(),creator:"Creator".into(),rights_note:"User-supplied, not verified".into(),alt_text:"A circle".into()};assert!(db.set_asset_provenance("target","a",&note).is_err());let mut bad=note.clone();bad.source_url="javascript:alert(1)".into();assert!(db.set_asset_provenance("source","a",&bad).is_err());bad=note.clone();bad.rights_note="x".repeat(4001);assert!(db.set_asset_provenance("source","a",&bad).is_err());db.set_asset_provenance("source","a",&note).unwrap();drop(db);let db=Db::open(p.clone()).unwrap();assert_eq!(db.list_assets("source")[0].provenance,Some(note));assert_eq!(db.list_assets("source")[0].data,"AAAA");assert!(db.library_assets().iter().all(|a|a.data.is_empty()));drop(db);let _=std::fs::remove_file(p);}
+#[test]fn copied_asset_is_independent_and_keeps_provenance(){let p=std::env::temp_dir().join(format!("library-copy-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();fixture(&db);let note=AssetProvenance{rights_note:"Check license".into(),..Default::default()};db.set_asset_provenance("source","a",&note).unwrap();assert!(db.copy_library_asset("missing","source","a").is_err());assert!(db.copy_library_asset("target","wrong","a").is_err());let copy=db.copy_library_asset("target","source","a").unwrap();assert_ne!(copy.id,"a");assert_eq!(copy.provenance,Some(note.clone()));assert_eq!(copy.data,"AAAA");db.set_asset_provenance("target",&copy.id,&AssetProvenance::default()).unwrap();db.delete_asset("a").unwrap();assert_eq!(db.list_assets("target")[0].data,"AAAA");assert_eq!(db.list_assets("target")[0].provenance,Some(AssetProvenance::default()));drop(db);let _=std::fs::remove_file(p);}
+}
+
+impl Db{
+ pub fn list_brands(&self)->Vec<BrandProfile>{let c=self.conn.lock().unwrap();let mut q=match c.prepare("SELECT doc FROM brand_profiles ORDER BY rowid DESC"){Ok(q)=>q,Err(_)=>return vec![]};let rows=q.query_map([],|r|r.get::<_,String>(0));match rows{Ok(r)=>r.filter_map(Result::ok).filter_map(|s|serde_json::from_str(&s).ok()).collect(),Err(_)=>vec![]}}
+ pub fn save_brand(&self,brand:&BrandProfile)->Result<(),String>{brand.validate()?;let mut b=brand.clone();b.updated_at=now();self.conn.lock().map_err(|_|"Database unavailable")?.execute("INSERT INTO brand_profiles(id,doc)VALUES(?1,?2)ON CONFLICT(id)DO UPDATE SET doc=excluded.doc",params![b.id,serde_json::to_string(&b).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;Ok(())}
+ pub fn delete_brand(&self,id:&str)->Result<(),String>{self.conn.lock().map_err(|_|"Database unavailable")?.execute("DELETE FROM brand_profiles WHERE id=?1",params![id]).map_err(|e|e.to_string())?;Ok(())}
+}
+
+#[cfg(test)]mod brand_tests{use super::*;
+#[test]fn brands_persist_validate_and_delete_without_touching_projects(){let p=std::env::temp_dir().join(format!("brand-{}.db",new_id("t")));let db=Db::open(p.clone()).unwrap();let b=BrandProfile{id:"brand".into(),name:"Editorial".into(),style_guide:"Quiet grid".into(),palette:vec!["#aabbcc".into()],brand_handle:"@fixture".into(),save_label:"Keep this".into(),updated_at:String::new()};let mut bad=b.clone();bad.palette=vec!["red;bad".into()];assert!(db.save_brand(&bad).is_err());bad=b.clone();bad.name=" ".into();assert!(db.save_brand(&bad).is_err());db.save_brand(&b).unwrap();drop(db);let db=Db::open(p.clone()).unwrap();assert_eq!(db.list_brands()[0].style_guide,"Quiet grid");assert_eq!(db.list_brands()[0].palette,vec!["#aabbcc"]);db.delete_brand("brand").unwrap();assert!(db.list_brands().is_empty());drop(db);let _=std::fs::remove_file(p);}}
+
+impl Db{
+ /// User-facing reads must distinguish absent records from failed/corrupt storage.
+ pub fn get_deck_checked(&self,id:&str)->Result<Option<Deck>,String>{
+  let conn=self.conn.lock().map_err(|_|"Project database unavailable")?;let raw:Option<String>=conn.query_row("SELECT doc FROM decks WHERE id=?1",params![id],|r|r.get(0)).optional().map_err(|_|"Cannot read saved project")?;
+  raw.map(|s|serde_json::from_str::<Deck>(&s).map_err(|_|"Saved project is damaged; original record was not changed".into())).transpose()
+ }
+ pub fn list_decks_checked(&self)->Result<Vec<DeckSummary>,String>{
+  let conn=self.conn.lock().map_err(|_|"Project database unavailable")?;let mut q=conn.prepare("SELECT id,title,aspect,doc,thumbnail,updated_at FROM decks ORDER BY updated_at DESC").map_err(|_|"Cannot read project list")?;
+  let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?))).map_err(|_|"Cannot read project list")?;
+  rows.map(|r|{let(id,title,aspect,raw,thumbnail,updated_at)=r.map_err(|_|"Cannot read project record")?;let deck:Deck=serde_json::from_str(&raw).map_err(|_|"A saved project is damaged; no records were changed")?;if deck.id!=id{return Err("Saved project identity mismatch".into())}Ok(DeckSummary{id,title,aspect,slide_count:deck.slides.len(),thumbnail,updated_at})}).collect()
+ }
+ pub fn get_settings_checked(&self)->Result<AppSettings,String>{let c=self.conn.lock().map_err(|_|"Settings database unavailable")?;let raw:Option<String>=c.query_row("SELECT value FROM settings WHERE key='app'",[],|r|r.get(0)).optional().map_err(|_|"Cannot read settings")?;match raw{Some(s)=>serde_json::from_str(&s).map_err(|_|"Saved settings are damaged; original record was not changed".into()),None=>Ok(AppSettings::default())}}
+}
+#[cfg(test)]mod checked_read_tests{use super::*;use serde_json::json;
+#[test]fn damaged_project_does_not_become_missing_or_empty(){let p=std::env::temp_dir().join(format!("checked-{}",new_id("t")));let db=Db::open(p.clone()).unwrap();assert!(db.get_deck_checked("missing").unwrap().is_none());let d:Deck=serde_json::from_value(json!({"id":"saved"})).unwrap();db.save_deck(&d,None).unwrap();db.conn.lock().unwrap().execute("UPDATE decks SET doc='broken json' WHERE id='saved'",[]).unwrap();assert!(db.get_deck_checked("saved").is_err());assert!(db.list_decks_checked().is_err());let raw:String=db.conn.lock().unwrap().query_row("SELECT doc FROM decks WHERE id='saved'",[],|r|r.get(0)).unwrap();assert_eq!(raw,"broken json");drop(db);let _=std::fs::remove_file(p);}
+#[test]fn settings_damage_and_sql_errors_are_not_defaults(){let p=std::env::temp_dir().join(format!("settings-checked-{}",new_id("t")));let db=Db::open(p.clone()).unwrap();assert!(db.get_settings_checked().is_ok());db.conn.lock().unwrap().execute("INSERT INTO settings(key,value)VALUES('app','broken json')",[]).unwrap();assert!(db.get_settings_checked().is_err());db.conn.lock().unwrap().execute("DROP TABLE decks",[]).unwrap();assert!(db.get_deck_checked("anything").is_err());assert!(db.list_decks_checked().is_err());drop(db);let _=std::fs::remove_file(p);}}
+
+#[cfg(test)]mod damaged_save_tests{use super::*;use serde_json::json;
+#[test]fn unconditional_save_preserves_corrupt_and_mismatched_records(){
+ let p=std::env::temp_dir().join(format!("damaged-save-{}",new_id("t")));let db=Db::open(p.clone()).unwrap();
+ let d:Deck=serde_json::from_value(json!({"id":"d","title":"Original"})).unwrap();db.save_deck(&d,None).unwrap();
+ for raw in ["broken json".to_string(),serde_json::to_string(&Deck{id:"other".into(),..d.clone()}).unwrap()]{
+  db.conn.lock().unwrap().execute("UPDATE decks SET doc=?1 WHERE id='d'",params![raw]).unwrap();
+  assert!(db.save_deck(&d,None).is_err());
+  let after:String=db.conn.lock().unwrap().query_row("SELECT doc FROM decks WHERE id='d'",[],|r|r.get(0)).unwrap();assert_eq!(after,raw);assert_eq!(db.deck_history_counts("d"),[0,0]);
+ }
+ drop(db);let _=std::fs::remove_file(p);
+}
 }

@@ -41,7 +41,7 @@ fn error(rule: &str, message: impl Into<String>) -> Issue {
 }
 
 fn lower(html: &str) -> String {
-    html.to_lowercase()
+    html.to_ascii_lowercase()
 }
 
 fn strip_style_and_tags(html: &str) -> String {
@@ -49,12 +49,12 @@ fn strip_style_and_tags(html: &str) -> String {
     let mut rest = html;
     // Drop <style>…</style>
     loop {
-        let Some(start) = rest.to_lowercase().find("<style") else {
+        let Some(start) = rest.to_ascii_lowercase().find("<style") else {
             out.push_str(rest);
             break;
         };
         out.push_str(&rest[..start]);
-        let Some(end) = rest[start..].to_lowercase().find("</style>") else {
+        let Some(end) = rest[start..].to_ascii_lowercase().find("</style>") else {
             break;
         };
         rest = &rest[start + end + 8..];
@@ -150,7 +150,7 @@ fn saturation((r, g, b): (u8, u8, u8)) -> f32 {
 
 fn numbers_after(html: &str, needle: &str) -> Vec<f32> {
     let mut out = Vec::new();
-    let hay = html.to_lowercase();
+    let hay = html.to_ascii_lowercase();
     let mut from = 0;
     while let Some(pos) = hay[from..].find(needle) {
         let start = from + pos + needle.len();
@@ -177,6 +177,7 @@ pub fn canvas(aspect: &str) -> (f32, f32) {
     match aspect {
         "1:1" => (1080.0, 1080.0),
         "9:16" => (1080.0, 1920.0),
+        "16:9" => (1920.0,1080.0),
         _ => (1080.0, 1350.0),
     }
 }
@@ -188,6 +189,12 @@ pub fn lint(html: &str, w: f32, h: f32) -> Vec<Issue> {
         return vec![error("empty", "HTML kosong.")];
     }
     let hay = lower(html);
+
+    // Decoration can invert the claim even when every word is sourced.
+    // Conservative warning, not a semantic correctness verdict.
+    if hay.contains("line-through") || hay.contains("strike:after") || hay.contains("strike::after") || hay.contains("<s>") || hay.contains("<del") {
+        issues.push(warn("semantic-decoration", "Coretan/penghapusan dapat membalik makna, terutama tanpa/tidak/no/without. Periksa kalimat yang dibaca dari render; hapus dekorasi bila negasi menjadi ambigu. Ini peringatan, bukan bukti klaim salah."));
+    }
 
     /* ---- hard rules ---------------------------------------------------- */
 
@@ -204,7 +211,7 @@ pub fn lint(html: &str, w: f32, h: f32) -> Vec<Issue> {
         if hay.contains(needle) {
             issues.push(error(
                 "external-asset",
-                "Ada aset eksternal (http). Gambar harus CSS atau inline SVG.",
+                "Aset remote (http) gagal diunduh otomatis; slide bisa tampil tanpa gambar saat diekspor. Ganti dengan URL lain atau artwork CSS/SVG.",
             ));
             break;
         }
@@ -226,6 +233,11 @@ pub fn lint(html: &str, w: f32, h: f32) -> Vec<Issue> {
     }
     if numbers_after(html, "margin:").is_empty() && !hay.contains("margin") {
         issues.push(warn("no-reset", "Tidak ada reset margin; body akan menyisakan tepi putih."));
+    }
+
+    /* ---- layout: text-on-text collisions (heuristic) -------------------- */
+    for issue in overlap_issues(html, w) {
+        issues.push(issue);
     }
 
     /* ---- design smells ------------------------------------------------- */
@@ -382,9 +394,325 @@ pub fn summarise(issues: &[Issue]) -> String {
         .join("\n")
 }
 
+
+/* --------------------------------------------------------------------------
+ * Text overlap heuristic.
+ *
+ * Slides position almost everything with `position:absolute` rules inside
+ * <style>. A string linter cannot run layout, but it can estimate boxes well
+ * enough to catch the gross failure: two readable text blocks occupying the
+ * same space. Conservative by design - it only fires when both elements are
+ * absolutely positioned with explicit top/left/font-size, ghost-type and tiny
+ * labels are ignored, and anything ambiguous (right/bottom anchoring, nested
+ * markup games) is skipped rather than guessed.
+ * ------------------------------------------------------------------------ */
+
+#[derive(Default, Clone)]
+struct TextBox {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    font_size: f32,
+    text: String,
+}
+
+fn decls(block: &str) -> Vec<(String, String)> {
+    block
+        .split(';')
+        .filter_map(|d| {
+            let (k, v) = d.split_once(':')?;
+            Some((k.trim().to_lowercase(), v.trim().to_lowercase()))
+        })
+        .collect()
+}
+
+fn px(v: &str) -> Option<f32> {
+    v.trim().trim_end_matches("px").trim().parse::<f32>().ok()
+}
+
+/// Simple selectors only: `.class`, `tag`, or `tag.class`.
+fn style_rules(html: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut rules = Vec::new();
+    let lc = html.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(off) = lc[search_from..].find("<style") {
+        let start = search_from + off;
+        let Some(open_end) = lc[start..].find('>') else { break };
+        let content_start = start + open_end + 1;
+        let Some(close) = lc[content_start..].find("</style>") else { break };
+        let css = &html[content_start..content_start + close];
+        for rule in css.split('}') {
+            let Some((sel, body)) = rule.split_once('{') else { continue };
+            let sel = sel.trim().to_lowercase();
+            if sel.is_empty()
+                || sel.contains(|c: char| c == ' ' || c == ',' || c == ':' || c == '@' || c == '>' || c == '+')
+            {
+                continue;
+            }
+            rules.push((sel, decls(body)));
+        }
+        search_from = content_start + close + 8;
+    }
+    rules
+}
+
+fn matching_props(
+    rules: &[(String, Vec<(String, String)>)],
+    tag: &str,
+    classes: &[String],
+    inline: &str,
+) -> Vec<(String, String)> {
+    let mut props: Vec<(String, String)> = Vec::new();
+    let mut apply = |list: &[(String, String)], props: &mut Vec<(String, String)>| {
+        for (k, v) in list {
+            props.retain(|(pk, _)| pk != k);
+            props.push((k.clone(), v.clone()));
+        }
+    };
+    for (sel, list) in rules {
+        let hit = if let Some(cls) = sel.strip_prefix('.') {
+            classes.iter().any(|c| c == cls)
+        } else if let Some((t, cls)) = sel.split_once('.') {
+            t == tag && classes.iter().any(|c| c == cls)
+        } else {
+            *sel == tag
+        };
+        if hit {
+            apply(list, &mut props);
+        }
+    }
+    apply(&decls(inline), &mut props);
+    props
+}
+
+fn color_alpha(v: &str) -> Option<f32> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        if hex.len() == 8 {
+            return u8::from_str_radix(&hex[6..8], 16).ok().map(|a| a as f32 / 255.0);
+        }
+        return None;
+    }
+    if v.starts_with("rgba") {
+        let inner = v.trim_start_matches("rgba").trim_matches(|c| c == '(' || c == ')');
+        return inner.split(',').nth(3).and_then(|a| a.trim().parse::<f32>().ok());
+    }
+    None
+}
+
+fn text_boxes(html: &str, canvas_w: f32) -> Vec<TextBox> {
+    let rules = style_rules(html);
+    let mut boxes = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let tags = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "span", "li", "a", "blockquote", "pre", "div"];
+    let mut i = 0usize;
+    while i < lower.len() {
+        if lower.as_bytes()[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &lower[i + 1..];
+        let tag = tags.iter().find(|t| {
+            rest.starts_with(*t)
+                && rest[t.len()..].starts_with(|c: char| c == ' ' || c == '>' || c == '\t' || c == '\n')
+        });
+        let Some(tag) = tag else {
+            i += 1;
+            continue;
+        };
+        let Some(gt) = rest.find('>') else { break };
+        let attrs = &rest[tag.len()..gt];
+        let get_attr = |name: &str, attrs: &str| -> String {
+            for m in attrs.match_indices(name) {
+                let after = &attrs[m.0 + name.len()..];
+                let after = after.trim_start();
+                if let Some(stripped) = after.strip_prefix('=') {
+                    let stripped = stripped.trim_start();
+                    if let Some(q) = stripped.chars().next() {
+                        if q == '"' || q == '\'' {
+                            if let Some(end) = stripped[1..].find(q) {
+                                return stripped[1..1 + end].to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            String::new()
+        };
+        let class_attr = get_attr("class", attrs);
+        let inline = get_attr("style", attrs);
+        let classes: Vec<String> = class_attr.split_whitespace().map(|s| s.to_lowercase()).collect();
+        let props = matching_props(&rules, tag, &classes, &inline);
+
+        let get = |k: &str| props.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.clone());
+        let absolute = get("position").map(|v| v == "absolute").unwrap_or(false);
+        let anchored = (get("top").and_then(|v| px(&v)), get("left").and_then(|v| px(&v)));
+        let (Some(top), Some(left)) = anchored else {
+            i += gt + 1;
+            continue;
+        };
+        if !absolute {
+            i += gt + 1;
+            continue;
+        }
+        let font_size = get("font-size").and_then(|v| px(&v)).unwrap_or(16.0);
+        if font_size < 20.0 {
+            i += gt + 1;
+            continue;
+        }
+        if get("opacity").and_then(|v| v.parse::<f32>().ok()).map(|o| o < 0.4).unwrap_or(false)
+            || get("color").and_then(|v| color_alpha(&v)).map(|a| a < 0.3).unwrap_or(false)
+        {
+            i += gt + 1;
+            continue; // ghost type is intentional layering
+        }
+        let content_start = i + 1 + gt + 1;
+        let close_pat = format!("</{tag}>");
+        let open_pat = format!("<{tag}");
+        let mut depth = 1usize;
+        let mut j = content_start;
+        let mut end = None;
+        while j < lower.len() {
+            if lower[j..].starts_with(&close_pat) {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(j);
+                    break;
+                }
+                j += close_pat.len();
+            } else if lower[j..].starts_with(&open_pat)
+                && lower[j + open_pat.len()..].starts_with(|c: char| c == ' ' || c == '>')
+            {
+                depth += 1;
+                j += open_pat.len();
+            } else {
+                j += lower[j..].chars().next().map(char::len_utf8).unwrap_or(1);
+            }
+        }
+        let Some(close_at) = end else { break };
+        let inner = strip_style_and_tags(&html[content_start..close_at]);
+        let text = inner.split_whitespace().collect::<Vec<_>>().join(" ");
+        i = close_at + close_pat.len();
+        if text.chars().count() < 3 {
+            continue;
+        }
+        let line_height = get("line-height")
+            .and_then(|v| {
+                let v = v.trim().to_string();
+                if let Some(p) = px(&v) {
+                    Some(p / font_size.max(1.0))
+                } else {
+                    v.parse::<f32>().ok()
+                }
+            })
+            .unwrap_or(1.2)
+            .max(0.7);
+        let declared_w = get("width").and_then(|v| px(&v));
+        let text_w = text.chars().count() as f32 * font_size * 0.52;
+        let max_w = (canvas_w - left - 60.0).max(80.0);
+        let width = declared_w.unwrap_or(text_w.min(max_w)).min(max_w).max(20.0);
+        let lines = (text_w / width).ceil().max(1.0);
+        // Estimates overshoot; discount half a line so only real collisions fire.
+        let height = ((lines - 0.5).max(0.5) * font_size * line_height).max(font_size * 0.8);
+        boxes.push(TextBox { left, top, width, height, font_size, text });
+    }
+    boxes
+}
+
+fn overlap_issues(html: &str, canvas_w: f32) -> Vec<Issue> {
+    let boxes = text_boxes(html, canvas_w);
+    let mut issues = Vec::new();
+    'outer: for a in 0..boxes.len() {
+        for b in (a + 1)..boxes.len() {
+            let (x, y) = (&boxes[a], &boxes[b]);
+            let ix = (x.left + x.width).min(y.left + y.width) - x.left.max(y.left);
+            let iy = (x.top + x.height).min(y.top + y.height) - x.top.max(y.top);
+            if ix <= 0.0 || iy <= 0.0 {
+                continue;
+            }
+            let inter = ix * iy;
+            let min_area = (x.width * x.height).min(y.width * y.height);
+            if min_area > 0.0 && inter / min_area > 0.3 {
+                let snip = |s: &str| {
+                    let s: String = s.chars().take(22).collect();
+                    if s.chars().count() < 22 { s } else { format!("{s}…") }
+                };
+                issues.push(warn(
+                    "overlap",
+                    format!(
+                        "Teks bertumpuk: \"{}\" ({:.0}px di top {:.0}) menimpa \"{}\" ({:.0}px di top {:.0}). Hitung ruang nyata tiap blok.",
+                        snip(&x.text), x.font_size, x.top, snip(&y.text), y.font_size, y.top
+                    ),
+                ));
+                if issues.len() >= 3 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    issues
+}
+
 #[cfg(test)]
+
 mod tests {
     use super::*;
+    #[test]
+    fn unicode_text_never_panics_or_shifts_html_offsets() {
+        let html = r#"<!doctype html><html><style>.title{position:absolute;left:80px;top:80px;font-size:70px;width:800px}</style><body><h1 class="title">İde → 日本語 🦀</h1></body></html>"#;
+        let boxes = text_boxes(html, 1080.0);
+        assert_eq!(boxes.len(), 1);
+        let _ = overlap_issues(html, 1080.0);
+    }
+
+    #[test]
+    fn gross_text_overlap_is_flagged() {
+        let html = r#"<!doctype html><html><head><style>
+            html,body{margin:0;width:1080px;height:1350px;background:#151515;color:#f5f2ec;font-family:Georgia}
+            h1{position:absolute;left:76px;top:200px;font-size:140px;line-height:.9;margin:0;width:900px}
+            .sub{position:absolute;left:76px;top:230px;font-size:34px;line-height:1.4;width:800px}
+            </style></head><body><h1>Judul Besar Sekali</h1>
+            <p class="sub">Subjudul panjang yang menjelaskan isi slide</p></body></html>"#;
+        let issues = lint(html, 1080.0, 1350.0);
+        assert!(issues.iter().any(|i| i.rule == "overlap"), "overlap harus terdeteksi: {issues:?}");
+    }
+
+    #[test]
+    fn separated_blocks_and_ghost_type_stay_legal() {
+        let html = r#"<!doctype html><html><head><style>
+            html,body{margin:0;width:1080px;height:1350px;background:#EDE4D2;color:#16130F;font-family:Georgia}
+            h1{position:absolute;left:76px;top:200px;font-size:140px;line-height:.9;margin:0;width:900px}
+            .sub{position:absolute;left:76px;top:600px;font-size:34px;line-height:1.4;width:800px}
+            .ghost{position:absolute;left:200px;top:220px;font-size:400px;line-height:.8;color:#16130f0a}
+            .num{position:absolute;left:76px;top:76px;font-size:150px;line-height:.8;color:#D9301E}
+            .kick{position:absolute;left:246px;top:104px;font-size:17px;letter-spacing:.24em;color:#8C8474}
+            </style></head><body><div class="ghost">f</div><div class="num">01</div>
+            <p class="kick">TOOL · JUNEGUNN</p><h1>Judul Besar Sekali</h1>
+            <p class="sub">Subjudul panjang yang menjelaskan isi slide</p></body></html>"#;
+        let issues = lint(html, 1080.0, 1350.0);
+        assert!(!issues.iter().any(|i| i.rule == "overlap"), "false positive: {issues:?}");
+    }
+
+    #[test]
+    fn agent_rewritten_slide_after_geometry_feedback_is_clean() {
+        // output of the live5 self-correction run: the model rewrote an
+        // overlapping slide after receiving the geometry finding
+        let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../desel-live/out/live5-geometry-slide-1.html"));
+        let Ok(html) = html else { return };
+        let issues = lint(&html, 1080.0, 1350.0);
+        assert!(!issues.iter().any(|i| i.rule == "overlap"), "slide hasil perbaikan masih overlap: {issues:?}");
+    }
+
+    #[test]
+    fn real_world_overlapping_slide_is_flagged() {
+        // slide-2 from the audited live1 deck (class-based absolute layout,
+        // the case the string linter missed entirely)
+        let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../desel-live/out/live1-full-slide-2.html"));
+        let Ok(html) = html else { return }; // evidence file absent in CI checkouts
+        let issues = lint(&html, 1080.0, 1350.0);
+        assert!(issues.iter().any(|i| i.rule == "overlap"), "slide nyata dengan overlap harus terdeteksi");
+    }
 
     const GOOD: &str = r#"<!doctype html><html><head><style>
         html,body{margin:0;width:1080px;height:1350px;overflow:hidden;background:#0d0c0b;color:#f2ece1}
@@ -414,10 +742,10 @@ mod tests {
     }
 
     #[test]
-    fn the_assembled_prompt_contains_the_example_once() {
+    fn the_assembled_prompt_has_no_style_anchoring_example() {
         let prompt = crate::agent::system_prompt();
-        assert_eq!(prompt.matches(crate::agent::EXAMPLE_SLIDE).count(), 1);
-        assert!(prompt.contains("Kerangka yang lolos"));
+        assert_eq!(prompt.matches(crate::agent::EXAMPLE_SLIDE).count(), 0);
+        assert!(prompt.contains("Acuan user mengalahkan resep"));
         assert!(prompt.contains("Pemeriksaan otomatis"));
     }
 
@@ -466,9 +794,18 @@ mod tests {
         assert!(!rules.contains(&"empty"), "CTA bertipografi besar bukan slide kosong: {}", summarise(&issues));
     }
     #[test]
+    fn strike_decorations_require_semantic_review() {
+        for html in ["<style>.strike:after{height:9px}</style><span>tanpa</span>", "<p style='text-decoration:line-through'>without</p>", "<s>tidak</s>"] {
+            assert!(lint(html,1080.0,1350.0).iter().any(|i|i.rule=="semantic-decoration"));
+        }
+        assert!(!lint("<p>tanpa cloud</p>",1080.0,1350.0).iter().any(|i|i.rule=="semantic-decoration"));
+    }
+    #[test]
     fn flags_canvas_size_mismatch() {
         let issues = lint("<html><body style=\"margin:0;width:1080px;height:1920px\">x</body></html>", 1080.0, 1350.0);
         let rules: Vec<&str> = issues.iter().map(|i| i.rule.as_str()).collect();
         assert!(rules.contains(&"canvas-size"), "{rules:?}");
     }
 }
+
+#[cfg(test)]mod landscape_tests{#[test]fn landscape_canvas_is_not_portrait_fallback(){assert_eq!(super::canvas("16:9"),(1920.0,1080.0));}}

@@ -1,7 +1,7 @@
 ﻿import { createRequire } from "node:module";
 const r = createRequire("C:/nvm4w/nodejs/node_modules/");
 const { chromium } = r("playwright");
-const b = await chromium.launch({ executablePath: "C:\\Users\\david\\AppData\\Local\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe", headless: true });
+const b = await chromium.launch({ executablePath: (process.env.CHROME_BIN || "chromium"), headless: true });
 const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
 await p.goto("http://127.0.0.1:1420/", { waitUntil: "networkidle" });
 await p.waitForTimeout(900);

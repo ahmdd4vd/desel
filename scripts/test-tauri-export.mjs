@@ -15,7 +15,7 @@ const require = createRequire("C:/nvm4w/nodejs/node_modules/");
 const { chromium } = require("playwright");
 
 const CHROME =
-  "C:/Users/david/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe";
+  (process.env.CHROME_BIN || "chromium");
 
 async function main() {
   const browser = await chromium.connectOverCDP("http://127.0.0.1:9222");

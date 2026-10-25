@@ -3,7 +3,7 @@ import { writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 
 const globalRequire = createRequire("C:/nvm4w/nodejs/node_modules/");
 const { chromium } = globalRequire("playwright");
-const EXE = "C:\\Users\\david\\AppData\\Local\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe";
+const EXE = (process.env.CHROME_BIN || "chromium");
 
 const slide = `<style>body{margin:0;width:1080px;height:1350px;overflow:hidden;background:#0d0c0b;
   color:#f1ebe0;font-family:Georgia,serif}h1{position:absolute;left:96px;top:300px;margin:0;

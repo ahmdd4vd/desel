@@ -15,15 +15,16 @@
 /* Deck + slide                                                               */
 /* -------------------------------------------------------------------------- */
 
-export type Aspect = "4:5" | "1:1" | "9:16";
+export type Aspect = "4:5" | "1:1" | "9:16" | "16:9";
 
 export const ASPECTS: { id: Aspect; label: string; w: number; h: number }[] = [
   { id: "4:5", label: "4:5 · 1080×1350", w: 1080, h: 1350 },
   { id: "1:1", label: "1:1 · 1080×1080", w: 1080, h: 1080 },
   { id: "9:16", label: "9:16 · 1080×1920", w: 1080, h: 1920 },
+  { id: "16:9", label: "16:9 · 1920×1080", w: 1920, h: 1080 },
 ];
 
-export function aspectSize(aspect: Aspect) {
+export function aspectSize(aspect: string) {
   return ASPECTS.find((a) => a.id === aspect) ?? ASPECTS[0];
 }
 
@@ -120,6 +121,7 @@ export interface Comment {
 export type ChatRole = "user" | "assistant" | "system" | "tool";
 
 export interface ChatMessage {
+  reasoningContent?:string;
   id: string;
   deckId: string;
   role: ChatRole;
@@ -145,7 +147,14 @@ export interface ToolCallRecord {
 /* Settings                                                                   */
 /* -------------------------------------------------------------------------- */
 
+export interface ModelCapability {id:string;inputModalities:string[];efforts:string[];defaultEffort?:string;reasoningMandatory:boolean;source:string;name?:string;contextWindow?:number;maxOutput?:number;reasoning?:boolean;metadataOrigin?:string;discoveredAt?:string;provider?:string;tools?:boolean}
+export interface ProviderConnection {id:string;name:string;kind:string;baseUrl:string;apiKey:string;model:string;reasoningEffort?:string;modelCapabilities?:ModelCapability[]}
 export interface AppSettings {
+  providerKind?:string;
+  activeConnection?:string;
+  connections?:ProviderConnection[];
+  reasoningEffort?:string;
+  modelCapabilities?:ModelCapability[];
   baseUrl: string;
   model: string;
   apiKey: string;
@@ -177,7 +186,11 @@ export interface ImageProfile {
   lightRatio: number;
 }
 
+export interface AssetProvenance { sourceUrl:string; creator:string; rightsNote:string; altText:string; }
 export interface Asset {
+  provenance?:AssetProvenance|null;
+  referenceRole?: "" | "cover" | "body" | "closer" | "asset";
+  referenceStatus?: "" | "candidate" | "approved" | "rejected";
   id: string;
   deckId: string | null;
   name: string;
@@ -195,6 +208,8 @@ export interface Asset {
 export type AgentEvent =
   | { type: "turn_start"; turn: number }
   | { type: "text_delta"; text: string }
+  | { type: "reasoning_delta"; text: string }
+  | { type:"render_request";request_id:string;index:number;revision?:string;candidate?:{base:Slide;slide:Slide;aspect:string} }
   | { type: "tool_call"; id: string; name: string; args: string }
   | { type: "tool_result"; id: string; name: string; result: string; ok: boolean }
   | { type: "deck_updated"; deck: Deck }
@@ -280,3 +295,4 @@ export interface SlideLint {
   slideId: string;
   issues: LintIssue[];
 }
+export interface BrandProfile{id:string;name:string;styleGuide:string;palette:string[];brandHandle:string;saveLabel:string;updatedAt:string}

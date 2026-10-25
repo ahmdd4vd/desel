@@ -16,7 +16,7 @@ const require = createRequire("C:/nvm4w/nodejs/node_modules/");
 const { chromium } = require("playwright");
 
 const CHROME =
-  "C:/Users/david/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe";
+  (process.env.CHROME_BIN || "chromium");
 
 const OUT = path.resolve("shots/export");
 mkdirSync(OUT, { recursive: true });

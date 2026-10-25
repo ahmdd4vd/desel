@@ -51,7 +51,7 @@ pub fn tool_specs(settings: &AppSettings) -> Value {
                     "properties": {
                         "title": { "type": "string" },
                         "caption": { "type": "string", "description": "Ready-to-post caption with hook + hashtags." },
-                        "aspect": { "type": "string", "enum": ["4:5", "1:1", "9:16"] },
+                        "aspect": { "type": "string", "enum": ["4:5", "1:1", "9:16", "16:9"] },
                         "styleGuide": { "type": "string", "description": "Short written spec of the visual system so every slide stays consistent: type stack, palette, texture, layout rules." },
                         "palette": { "type": "array", "items": { "type": "string" }, "description": "Hex colours used." },
                         "brandHandle": { "type": "string" },
@@ -75,6 +75,24 @@ pub fn tool_specs(settings: &AppSettings) -> Value {
                         "rationale": { "type": "string", "description": "One line on the design decision for this slide." }
                     },
                     "required": ["html"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "patch_slide",
+                "description": "Apply ONE targeted edit to an existing slide instead of rewriting it. Prefer this for revision requests: every patch lands on the user's canvas immediately, so a revision shows up as a sequence of visible edits. Use write_slide only when the slide's direction changes completely. Read the slide first if unsure of its structure.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "index": { "type": "integer", "description": "0-based slide position." },
+                        "op": { "type": "string", "enum": ["set_text", "replace_html", "append_html", "remove"], "description": "set_text: replace an element's text. replace_html: replace an element with an HTML fragment. append_html: append a fragment (to the element matching selector, or body). remove: delete an element." },
+                        "selector": { "type": "string", "description": "CSS selector of the target element (ids/classes you assigned when writing the slide). Not needed for append_html to body." },
+                        "html": { "type": "string", "description": "HTML fragment for replace_html / append_html." },
+                        "text": { "type": "string", "description": "New text content for set_text." }
+                    },
+                    "required": ["index", "op"]
                 }
             }
         }),
@@ -129,7 +147,7 @@ pub fn tool_specs(settings: &AppSettings) -> Value {
             "type": "function",
             "function": {
                 "name": "ask_user",
-                "description": "Pause and ask the user a clarifying question. Use this when the brief is genuinely ambiguous (missing subject, missing brand, unclear format). Do NOT use it to ask for permission.",
+                "description": "Pause the workflow and ask a concise clarifying question when an important decision is unresolved. Wait for the answer before slide mutations. Do not ask again for known details or force a fixed slide count, brand, research step or permission ritual.",
                 "parameters": {
                     "type": "object",
                     "properties": { "question": { "type": "string" } },
@@ -139,6 +157,13 @@ pub fn tool_specs(settings: &AppSettings) -> Value {
         }),
     ];
 
+    if settings.send_references {
+        tools.push(json!({"type":"function","function":{"name":"review_render","description":"Request an actual rendered PNG of ONE current slide for visual critique (not HTML/lint). Available only with vision enabled. Inspect layout, image crop, contrast, hierarchy, reference match, overflow. Fix issues and request another render. Do not claim you saw pixels unless image returned. Desktop must be open.","parameters":{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"]}}}));
+    }
+    if settings.enable_research {
+        tools.push(json!({"type":"function","function":{"name":"import_image","description":"Download an observed public image URL into this deck's asset library. Supply the actual source page, intended role and rights note. Returns an asset ID. Use use_asset in slide HTML rather than repeating base64. Crop/layout via CSS object-fit/object-position. Not video, not image generation, and not a license grant.","parameters":{"type":"object","properties":{"url":{"type":"string"},"sourceUrl":{"type":"string"},"role":{"type":"string"},"rightsNote":{"type":"string"}},"required":["url","sourceUrl","role","rightsNote"]}}}));
+        tools.push(json!({"type":"function","function":{"name":"github_trending","description":"Read GitHub Trending primary daily/weekly/monthly list with timestamp and actual repo links, not search rank. Verify each selected repo/docs before claims. Public page can block or change.","parameters":{"type":"object","properties":{"since":{"type":"string","enum":["daily","weekly","monthly"]}},"required":[]}}}));
+    }
     if settings.enable_research {
         tools.push(json!({
             "type": "function",
@@ -187,7 +212,8 @@ pub async fn execute(ctx: &ToolContext<'_>, name: &str, args: &Value) -> ToolOut
     match name {
         "read_deck" => read_deck(ctx, args),
         "set_deck_meta" => set_deck_meta(ctx, args),
-        "write_slide" => write_slide(ctx, args),
+        "write_slide" => write_slide(ctx, args).await,
+        "patch_slide" => patch_slide(ctx, args).await,
         "delete_slide" => delete_slide(ctx, args),
         "save_template" => save_template(ctx, args),
         "list_templates" => list_templates(ctx),
@@ -211,6 +237,8 @@ pub async fn execute(ctx: &ToolContext<'_>, name: &str, args: &Value) -> ToolOut
         }
         "search_web" => search_web(ctx, args).await,
         "fetch_url" => fetch_url(ctx, args).await,
+        "github_trending" => {let since=arg_str(args,"since");let since=if ["daily","weekly","monthly"].contains(&since.as_str()){since.as_str()}else{"daily"};if !ctx.settings.enable_research {ToolOutcome{content:"error: research disabled".into(),deck:None,pause_question:None}}else{ToolOutcome{content:crate::research::github_trending(since).await.unwrap_or_else(|e|format!("error: {e}")),deck:None,pause_question:None}}},
+        "import_image" => import_image(ctx,args).await,
         other => ToolOutcome {
             content: format!("Unknown tool: {other}"),
             deck: None,
@@ -242,6 +270,8 @@ fn persist(ctx: &ToolContext<'_>, deck: &mut Deck) -> Option<Deck> {
     Some(deck.clone())
 }
 
+pub fn compact_asset_html(ctx:&ToolContext<'_>,html:&str)->String{let mut out=html.to_string();for a in ctx.db.list_assets(&ctx.deck_id){if !a.data.is_empty(){out=out.replace(&format!("data:{};base64,{}",a.mime,a.data),&format!("asset:{}",a.id));}}out}
+
 fn read_deck(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     let deck = load_or_default(ctx);
 
@@ -263,7 +293,7 @@ fn read_deck(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
                 "index": index,
                 "title": slide.title,
                 "rationale": slide.rationale,
-                "html": slide.html,
+                "html": compact_asset_html(ctx,&slide.html),
                 "styleGuide": deck.style_guide,
                 "palette": deck.palette,
                 "aspect": deck.aspect
@@ -316,7 +346,7 @@ fn set_deck_meta(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
         deck.caption = v.to_string();
     }
     if let Some(v) = args.get("aspect").and_then(|v| v.as_str()) {
-        if ["4:5", "1:1", "9:16"].contains(&v) {
+        if ["4:5", "1:1", "9:16", "16:9"].contains(&v) {
             deck.aspect = v.to_string();
         }
     }
@@ -345,7 +375,241 @@ fn set_deck_meta(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     }
 }
 
-fn write_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
+/// Remote image URLs referenced by a slide's markup (`<img src>` and CSS
+/// `url(...)`), de-duplicated, capped so a runaway slide cannot stall the agent.
+fn collect_remote_image_urls(html: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    let mut push = |u: &str| {
+        let u = u.trim().trim_matches(|c| c == '"' || c == '\'' || c == ')');
+        if u.starts_with("http://") || u.starts_with("https://") {
+            if !urls.iter().any(|x| x == u) {
+                urls.push(u.to_string());
+            }
+        }
+    };
+    let mut rest = html;
+    while let Some(pos) = rest.find("src=") {
+        let after = &rest[pos + 4..];
+        let after = after.trim_start();
+        if let Some(stripped) = after.strip_prefix(|c| c == '"' || c == '\'') {
+            let q = after.chars().next().unwrap();
+            if let Some(end) = stripped.find(q) {
+                push(&stripped[..end]);
+            }
+        }
+        rest = &rest[pos + 4..];
+    }
+    let mut rest = html;
+    while let Some(pos) = rest.find("url(") {
+        let after = &rest[pos + 4..];
+        if let Some(end) = after.find(')') {
+            push(&after[..end]);
+        }
+        rest = &rest[pos + 4..];
+    }
+    urls.truncate(4);
+    urls
+}
+
+/// Trust the bytes, not the URL or the Content-Type header.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.len() > 12 && &bytes[4..8] == b"ftyp" {
+        Some("image/avif")
+    } else {
+        None
+    }
+}
+
+/// Download every remote image a slide references and swap it for an embedded
+/// data URI. Anything that fails (offline, wrong type, too big) is left as-is
+/// and reported, so the model can swap in CSS/SVG art instead.
+/// Addresses the downloader must never reach: loopback, RFC1918, link-local
+/// (covers the 169.254.169.254 cloud metadata endpoint), CGNAT, multicast,
+/// and the IPv6 equivalents.
+fn blocked_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
+                || o[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Static checks on a model-supplied image URL, before any DNS or traffic.
+fn validate_image_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| e.to_string())?;
+    match url.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("skema {s}: tidak didukung")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL dengan kredensial ditolak".into());
+    }
+    match url.host_str() {
+        None => Err("URL tanpa host".into()),
+        Some(host) => {
+            // IPv6 literals keep their brackets in host_str ("[::1]").
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+                if blocked_ip(&ip) {
+                    return Err(format!("alamat {ip} bukan alamat publik"));
+                }
+            }
+            Ok(url)
+        }
+    }
+}
+
+/// Resolve the host and pin the client to a verified-public address, so a DNS
+/// answer cannot be swapped between our check and the actual connect.
+async fn pinned_client(url: &reqwest::Url) -> Result<reqwest::Client, String> {
+    let host = url.host_str().ok_or("URL tanpa host")?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addr = if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        std::net::SocketAddr::new(ip, port)
+    } else {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| e.to_string())?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("{host} tidak resolve"));
+        }
+        for a in &addrs {
+            if blocked_ip(&a.ip()) {
+                return Err(format!("{host} resolve ke alamat non-publik {}", a.ip()));
+            }
+        }
+        addrs[0]
+    };
+    reqwest::Client::builder()
+        .user_agent("desel/0.1")
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, addr)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Fetch an image with SSRF protection: scheme/credential checks, pinned
+/// public IP, manually re-validated redirects, and a hard cap on the streamed
+/// body (no automatic decompression, so a gzip bomb lands as non-image bytes
+/// and is rejected by the magic sniff instead of exploding in memory).
+fn unsupported_image_message(bytes:&[u8])->String{
+ let head=String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]).to_ascii_lowercase();
+ if head.contains("<svg") {"SVG belum didukung importer raster. Jangan ulangi URL ini atau menebak ekstensi PNG. Gunakan screenshot PNG/JPEG/WebP yang benar-benar ditemukan dari halaman sumber; aset yang sudah berhasil diimpor tetap bisa digunakan. Bila tidak ada, sebut gap aset, jangan buat logo/screenshot palsu.".into()}
+ else if head.contains("<html")||head.contains("<!doctype html") {"URL mengembalikan halaman HTML, bukan gambar. Ambil URL gambar dari OBSERVED IMAGES sumber; jangan menebak path atau ekstensi. Gunakan aset berhasil diimpor bila cukup.".into()}
+ else {"Format gambar tidak didukung. Importer menerima PNG/JPEG/GIF/WebP terverifikasi dari byte. Jangan ulangi sumber yang sama; gunakan aset berhasil diimpor atau jelaskan gap.".into()}
+}
+
+async fn fetch_image_data_uri(raw_url: &str, max_bytes: usize) -> Result<String, String> {
+    let mut url = validate_image_url(raw_url)?;
+    for _hop in 0..4 {
+        let client = pinned_client(&url).await?;
+        let resp = client.get(url.clone()).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| format!("redirect {status} tanpa Location"))?;
+            url = validate_image_url(
+                url.join(location).map_err(|e| e.to_string())?.as_str(),
+            )?;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(format!("status {status}"));
+        }
+        if let Some(len) = resp.content_length() {
+            if len as usize > max_bytes {
+                return Err(format!("terlalu besar ({} KB)", len / 1024));
+            }
+        }
+        let mut resp = resp;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len() + chunk.len() > max_bytes {
+                return Err(format!("terlalu besar (>{} KB)", max_bytes / 1024));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let mime = sniff_image_mime(&bytes).ok_or_else(|| unsupported_image_message(&bytes))?;
+        use base64::Engine;
+        return Ok(format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        ));
+    }
+    Err("terlalu banyak redirect".into())
+}
+
+async fn localize_remote_images(html: &str) -> (String, Vec<String>) {
+    const MAX_BYTES: usize = 5 * 1024 * 1024;
+    let urls = collect_remote_image_urls(html);
+    if urls.is_empty() {
+        return (html.to_string(), Vec::new());
+    }
+    let mut out = html.to_string();
+    let mut notes = Vec::new();
+    for url in urls {
+        let short: String = url.chars().take(80).collect();
+        match fetch_image_data_uri(&url, MAX_BYTES).await {
+            Ok(data_uri) => {
+                out = out.replace(&url, &data_uri);
+                notes.push(format!("- {short} -> aset lokal"));
+            }
+            Err(e) => notes.push(format!("- {short} GAGAL diunduh ({e}); dibiarkan sebagai URL remote")),
+        }
+    }
+    (out, notes)
+}
+
+fn resolve_assets(ctx:&ToolContext<'_>,html:&str)->String{let assets=ctx.db.list_assets(&ctx.deck_id).into_iter().map(|a|(a.id.clone(),a)).collect::<std::collections::HashMap<_,_>>();regex::Regex::new(r"asset:([A-Za-z0-9_-]+)").unwrap().replace_all(html,|caps:&regex::Captures|assets.get(&caps[1]).map(|a|format!("data:{};base64,{}",a.mime,a.data)).unwrap_or_else(||caps[0].to_string())).into_owned()}
+
+async fn write_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
+    // Remote images cannot be rendered by the in-app preview/export reliably
+    // (CORS, offline), so pull them into the slide as embedded assets the
+    // moment they arrive. The model keeps designing with normal URLs and the
+    // deck stays portable.
+    let raw=resolve_assets(ctx,&arg_str(args,"html"));
+    let (html, notes) = localize_remote_images(&raw).await;
+    let mut local_args = args.clone();
+    local_args["html"] = json!(html);
+    let mut outcome = write_slide_inner(ctx, &local_args);
+    if !notes.is_empty() {
+        outcome.content.push_str("\nAset gambar:\n");
+        outcome.content.push_str(&notes.join("\n"));
+    }
+    outcome
+}
+
+fn write_slide_inner(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     let mut deck = load_or_default(ctx);
     let html = arg_str(args, "html");
 
@@ -422,6 +686,162 @@ fn write_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
         deck: updated,
         pause_question: None,
     }
+}
+
+async fn patch_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
+    let mut deck = load_or_default(ctx);
+    let idx = arg_i64(args, "index", -1);
+    if idx < 0 || idx as usize >= deck.slides.len() {
+        return ToolOutcome {
+            content: format!("error: no slide at index {idx}"),
+            deck: None,
+            pause_question: None,
+        };
+    }
+    let i = idx as usize;
+    let op = arg_str(args, "op");
+    let selector = arg_str(args, "selector");
+    let text = arg_str(args, "text");
+    let raw_fragment = resolve_assets(ctx,&arg_str(args, "html"));
+    // Fragments get the same remote-image localization as full slide writes.
+    let (fragment, notes) = if raw_fragment.trim().is_empty() {
+        (raw_fragment, Vec::new())
+    } else {
+        localize_remote_images(&raw_fragment).await
+    };
+    let source = deck.slides[i].html.clone();
+    match apply_patch(&source, &op, &selector, &fragment, &text) {
+        Ok(patched) => {
+            deck.slides[i].html = patched;
+            let updated = persist(ctx, &mut deck);
+            let (w, h) = crate::lint::canvas(&deck.aspect);
+            let issues = crate::lint::lint(&deck.slides[i].html, w, h);
+            let review = if issues.is_empty() {
+                String::from("Pemeriksaan desain: bersih.")
+            } else {
+                format!(
+                    "Pemeriksaan desain ({} temuan):\n{}",
+                    issues.len(),
+                    crate::lint::summarise(&issues)
+                )
+            };
+            let mut content = format!("slide {i} patched (op: {op}).\n{review}");
+            if !notes.is_empty() {
+                content.push_str("\nAset gambar:\n");
+                content.push_str(&notes.join("\n"));
+            }
+            ToolOutcome {
+                content,
+                deck: updated,
+                pause_question: None,
+            }
+        }
+        Err(e) => ToolOutcome {
+            content: format!("error: {e}"),
+            deck: None,
+            pause_question: None,
+        },
+    }
+}
+
+/// Apply one targeted edit to a slide document. Pure: no db, no IO.
+fn apply_patch(source: &str, op: &str, selector: &str, fragment: &str, text: &str) -> Result<String, String> {
+    use ego_tree::{NodeId, NodeMut, NodeRef, Tree};
+    use scraper::node::{Node, Text};
+    use scraper::{ElementRef, Html, Selector};
+
+    fn find_id(tree: &Tree<Node>, selector: &str) -> Result<NodeId, String> {
+        let sel = Selector::parse(selector).map_err(|_| format!("selector CSS tidak valid: `{selector}`"))?;
+        for node in tree.root().descendants() {
+            if let Some(el) = ElementRef::wrap(node) {
+                if sel.matches(&el) {
+                    return Ok(node.id());
+                }
+            }
+        }
+        Err(format!("tidak ada elemen yang cocok dengan `{selector}`"))
+    }
+
+    fn copy_children(src: NodeRef<'_, Node>, dst: &mut NodeMut<'_, Node>) {
+        for child in src.children() {
+            let mut n = dst.append(child.value().clone());
+            copy_children(child, &mut n);
+        }
+    }
+
+    let mut doc = Html::parse_document(source);
+    match op {
+        "set_text" => {
+            if selector.trim().is_empty() {
+                return Err("set_text butuh `selector`".into());
+            }
+            let id = find_id(&doc.tree, selector)?;
+            let child_ids: Vec<NodeId> = {
+                let node = doc.tree.get(id).ok_or("node hilang")?;
+                node.children().map(|c| c.id()).collect()
+            };
+            for cid in child_ids {
+                if let Some(mut c) = doc.tree.get_mut(cid) {
+                    c.detach();
+                }
+            }
+            let mut node = doc.tree.get_mut(id).ok_or("node hilang")?;
+            node.append(Node::Text(Text { text: text.into() }));
+        }
+        "replace_html" => {
+            if selector.trim().is_empty() {
+                return Err("replace_html butuh `selector`".into());
+            }
+            if fragment.trim().is_empty() {
+                return Err("replace_html butuh `html` fragment".into());
+            }
+            let id = find_id(&doc.tree, selector)?;
+            let frag = Html::parse_fragment(fragment);
+            let frag_children: Vec<NodeRef<'_, Node>> = frag.tree.root().children().collect();
+            let mut target = doc.tree.get_mut(id).ok_or("node hilang")?;
+            for child in &frag_children {
+                let mut inserted = target.insert_before(child.value().clone());
+                copy_children(*child, &mut inserted);
+            }
+            target.detach();
+        }
+        "append_html" => {
+            if fragment.trim().is_empty() {
+                return Err("append_html butuh `html` fragment".into());
+            }
+            let sel = if selector.trim().is_empty() { "body" } else { selector };
+            let id = find_id(&doc.tree, sel)?;
+            let frag = Html::parse_fragment(fragment);
+            let frag_children: Vec<NodeRef<'_, Node>> = frag.tree.root().children().collect();
+            let mut target = doc.tree.get_mut(id).ok_or("node hilang")?;
+            for child in &frag_children {
+                let mut appended = target.append(child.value().clone());
+                copy_children(*child, &mut appended);
+            }
+        }
+        "remove" => {
+            if selector.trim().is_empty() {
+                return Err("remove butuh `selector`".into());
+            }
+            let id = find_id(&doc.tree, selector)?;
+            let mut target = doc.tree.get_mut(id).ok_or("node hilang")?;
+            target.detach();
+        }
+        other => {
+            return Err(format!(
+                "op tidak dikenal: `{other}` (pakai set_text / replace_html / append_html / remove)"
+            ));
+        }
+    }
+    let out = doc.html();
+    // html5ever keeps the doctype node, but guard anyway: the preview and
+    // export render srcDoc, where a missing doctype flips quirks mode.
+    if source.trim_start().to_lowercase().starts_with("<!doctype")
+        && !out.trim_start().to_lowercase().starts_with("<!doctype")
+    {
+        return Ok(format!("<!doctype html>\n{out}"));
+    }
+    Ok(out)
 }
 
 fn delete_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
@@ -603,6 +1023,14 @@ async fn fetch_url(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     }
 }
 
+async fn import_image(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
+ if !ctx.settings.enable_research{return ToolOutcome{content:"research disabled".into(),deck:None,pause_question:None}}
+ let url=arg_str(args,"url");let source=arg_str(args,"sourceUrl");let role=arg_str(args,"role");let rights=arg_str(args,"rightsNote");
+ if source.trim().is_empty()||role.trim().is_empty()||rights.trim().is_empty(){return ToolOutcome{content:"error: sourceUrl, role and rightsNote required; do not invent licensing permission".into(),deck:None,pause_question:None}}
+ let result=async{let provenance=crate::model::AssetProvenance{source_url:source.clone(),creator:String::new(),rights_note:rights.clone(),alt_text:String::new()};provenance.validate()?;let data_uri=fetch_image_data_uri(&url,5*1024*1024).await?;let (prefix,data)=data_uri.split_once(',').ok_or("invalid image")?;let mime=prefix.trim_start_matches("data:").trim_end_matches(";base64");let id=crate::db::new_id("asset");use base64::Engine as _;let profile=base64::engine::general_purpose::STANDARD.decode(data).ok().and_then(|bytes|crate::palette::analyse(&bytes));let asset=Asset {provenance:Some(provenance),reference_role:if ["cover","body","closer","asset"].contains(&role.as_str()){role.clone()}else{String::new()},reference_status:"candidate".into(),id:id.clone(),deck_id:Some(ctx.deck_id.clone()),name:role.clone(),mime:mime.into(),data:data.into(),profile,created_at:chrono::Utc::now().to_rfc3339()};ctx.db.add_asset(&asset).map_err(|e|e.to_string())?;Ok::<_,String>(format!("Imported {id}. Use <img src=\"asset:{id}\"> in write_slide. Source and rights note stored; rights are your supplied note, not verified permission."))}.await;
+ ToolOutcome{content:result.unwrap_or_else(|e|{let assets=ctx.db.list_assets(&ctx.deck_id).into_iter().filter(|a|a.id.starts_with("asset_")).map(|a|format!("{}: {}",a.id,a.name.chars().take(120).collect::<String>())).collect::<Vec<_>>();format!("image import failed: {e}\nExisting imported assets (not lost): {}. Stop repeated asset hunting when existing relevant screenshots suffice; disclose any missing artwork instead of inventing it.",assets.join("; "))}),deck:None,pause_question:None}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +1062,102 @@ mod tests {
     }
 
     #[test]
+    fn slide_count_is_dynamic_not_a_six_slide_template() {
+        let (path, db, id) = temp_env();
+        let c = ctx(&db, &id);
+        assert_eq!(db.get_deck(&id).unwrap().slides.len(), 0);
+        for expected in 1..=11 {
+            write_slide_inner(&c, &json!({"html":"<!doctype html><html><body>Isi</body></html>"}));
+            assert_eq!(db.get_deck(&id).unwrap().slides.len(), expected);
+        }
+        drop(c); drop(db); let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn six_slide_count_and_invalid_delete_are_stable() {
+        let (path, db, id) = temp_env();
+        let c = ctx(&db, &id);
+        for i in 0..6 {
+            write_slide_inner(&c, &json!({"index":i,"title":format!("Slide {i}"),"html":"<!doctype html><html><body>Isi</body></html>"}));
+        }
+        let before = db.get_deck(&id).unwrap();
+        assert_eq!(before.slides.len(),6);
+        for index in [-1,6,7,999] {
+            let out = delete_slide(&c,&json!({"index":index}));
+            assert!(out.content.starts_with("error:"));
+            assert!(out.deck.is_none());
+            let after=db.get_deck(&id).unwrap();
+            assert_eq!(serde_json::to_value(&before).unwrap(),serde_json::to_value(&after).unwrap());
+        }
+        delete_slide(&c,&json!({"index":5}));
+        assert_eq!(db.get_deck(&id).unwrap().slides.len(),5);
+        drop(c);drop(db);let _=std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_image_urls_are_collected_from_img_and_css() {
+        let html = r#"<img src="https://cdn.example.com/a.png">
+            <div style="background-image:url('https://cdn.example.com/b.jpg')"></div>
+            <img src="data:image/png;base64,xx">
+            <img src="https://cdn.example.com/a.png">"#;
+        let urls = collect_remote_image_urls(html);
+        assert_eq!(urls, vec!["https://cdn.example.com/a.png", "https://cdn.example.com/b.jpg"]);
+    }
+
+    #[test]
+    fn remote_image_collection_is_capped() {
+        let mut html = String::new();
+        for i in 0..8 {
+            html.push_str(&format!(r#"<img src="https://cdn.example.com/{i}.png">"#));
+        }
+        assert_eq!(collect_remote_image_urls(&html).len(), 4);
+    }
+
+    #[test]
+    fn image_magic_bytes_are_sniffed_not_trusted() {
+        assert_eq!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 1, 2]), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(&[0x89, 0x50, 0x4E, 0x47, 1, 2]), Some("image/png"));
+        assert_eq!(sniff_image_mime(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(sniff_image_mime(b"RIFFxxxxWEBPvp"), Some("image/webp"));
+        assert_eq!(sniff_image_mime(b"<xml></xml>"), None);
+        assert_eq!(sniff_image_mime(b""), None);
+    }
+
+    #[test]
+    fn private_and_metadata_addresses_are_rejected() {
+        for bad in [
+            "http://127.0.0.1/x.png",
+            "http://localhost/x.png", // resolved later; literal check must not crash
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.4/internal.png",
+            "http://192.168.1.1/cam.png",
+            "http://172.16.0.9/x.png",
+            "http://[::1]/x.png",
+            "http://100.64.0.5/x.png",
+            "file:///etc/passwd",
+            "https://user:pass@example.com/x.png",
+        ] {
+            if bad.contains("localhost") {
+                // hostnames resolve at fetch time; static validation must accept
+                // the URL shape and let the resolver guard reject it.
+                assert!(validate_image_url(bad).is_ok(), "{bad}");
+                continue;
+            }
+            assert!(validate_image_url(bad).is_err(), "{bad} harus ditolak");
+        }
+        assert!(validate_image_url("https://example.com/x.png").is_ok());
+        assert!(validate_image_url("http://8.8.8.8/x.png").is_ok());
+    }
+
+    #[tokio::test]
+    async fn loopback_image_is_never_fetched() {
+        let err = fetch_image_data_uri("http://127.0.0.1:1/secret.png", 1024)
+            .await
+            .expect_err("loopback harus ditolak sebelum jaringan");
+        assert!(err.contains("bukan alamat publik"), "{err}");
+    }
+
+    #[test]
     fn the_agent_can_write_a_deck_from_scratch_and_it_persists() {
         let (path, db, deck_id) = temp_env();
         let c = ctx(&db, &deck_id);
@@ -651,7 +1175,7 @@ mod tests {
 
         // 2. write a slide from nothing
         let html = "<!doctype html><html><head><style>body{margin:0;width:1080px;height:1350px;background:#0d0c0b;color:#f2ece1;font-family:Georgia}</style></head><body><h1>Cover</h1></body></html>";
-        let out = write_slide(&c, &json!({ "title": "Cover", "html": html, "rationale": "poster" }));
+        let out = write_slide_inner(&c, &json!({ "title": "Cover", "html": html, "rationale": "poster" }));
         assert!(out.content.contains("slide"), "{}", out.content);
 
         // 3. it is on disk, not just in memory
@@ -701,7 +1225,7 @@ mod tests {
     fn an_untitled_deck_is_named_after_its_first_slide() {
         let (path, db, deck_id) = temp_env();
         let c = ctx(&db, &deck_id);
-        write_slide(
+        write_slide_inner(
             &c,
             &json!({
                 "title": "Kenapa brief yang jelas menang",
@@ -716,18 +1240,18 @@ mod tests {
         let (path, db, deck_id) = temp_env();
         let c = ctx(&db, &deck_id);
 
-        write_slide(
+        write_slide_inner(
             &c,
             &json!({ "index": 0, "title": "Cover", "html": "<!doctype html><html><body>awal</body></html>" }),
         );
-        write_slide(
+        write_slide_inner(
             &c,
             &json!({ "index": 1, "title": "Isi", "html": "<!doctype html><html><body>isi</body></html>" }),
         );
         assert_eq!(db.get_deck(&deck_id).unwrap().slides.len(), 2);
 
         // Same index again = the lint fix the prompt asks for, not a new slide.
-        write_slide(
+        write_slide_inner(
             &c,
             &json!({ "index": 0, "title": "Cover", "html": "<!doctype html><html><body>diperbaiki</body></html>" }),
         );
@@ -744,7 +1268,7 @@ mod tests {
     fn reading_one_slide_returns_its_real_html() {
         let (path, db, deck_id) = temp_env();
         let c = ctx(&db, &deck_id);
-        write_slide(
+        write_slide_inner(
             &c,
             &json!({
                 "index": 0,
@@ -773,4 +1297,95 @@ mod tests {
         assert!(out.content.contains("4:5"), "{}", out.content);
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn apply_patch_ops_edit_only_the_target() {
+        let html = r#"<!doctype html><html><head><style>body{margin:0}</style></head><body><div class="pad"><h1 id="t">Lama</h1><p class="sub">sub lama</p><div class="card">satu</div></div></body></html>"#;
+
+        let out = apply_patch(html, "set_text", "#t", "", "Judul Baru").unwrap();
+        assert!(out.contains("Judul Baru"), "{out}");
+        assert!(!out.contains("Lama"), "{out}");
+        assert!(out.trim_start().to_lowercase().starts_with("<!doctype"), "doctype hilang: {out}");
+        assert!(out.contains(r#"<p class="sub">sub lama</p>"#), "elemen lain tersentuh: {out}");
+
+        let out = apply_patch(html, "append_html", "", r#"<p id="new">tambahan</p>"#, "").unwrap();
+        assert!(out.contains("tambahan"), "{out}");
+
+        let out = apply_patch(html, "replace_html", ".card", r#"<div class="card">DUA</div>"#, "").unwrap();
+        assert!(out.contains("DUA") && !out.contains(">satu<"), "{out}");
+
+        let out = apply_patch(html, "remove", ".sub", "", "").unwrap();
+        assert!(!out.contains("sub lama"), "{out}");
+
+        let err = apply_patch(html, "set_text", "#nope", "", "x").unwrap_err();
+        assert!(err.contains("tidak ada elemen"), "{err}");
+
+        let err = apply_patch(html, "set_text", "h1[", "", "x").unwrap_err();
+        assert!(err.contains("selector CSS tidak valid"), "{err}");
+
+        let err = apply_patch(html, "teleport", "#t", "", "x").unwrap_err();
+        assert!(err.contains("op tidak dikenal"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn patch_slide_tool_persists_each_edit_as_it_lands() {
+        let (path, db, deck_id) = temp_env();
+        let c = ctx(&db, &deck_id);
+        write_slide_inner(
+            &c,
+            &json!({
+                "title": "Cover",
+                "html": r#"<!doctype html><html><body><h1 id="t">Lama</h1><p class="sub">sub</p></body></html>"#
+            }),
+        );
+
+        // Each patch is one visible edit: a revision is a sequence of these,
+        // not one wholesale page swap.
+        let out = patch_slide(&c, &json!({"index": 0, "op": "set_text", "selector": "#t", "text": "Baru"})).await;
+        assert!(out.deck.is_some(), "{}", out.content);
+        let stored = db.get_deck(&deck_id).unwrap();
+        assert!(stored.slides[0].html.contains("Baru"), "{}", stored.slides[0].html);
+        assert!(stored.slides[0].html.trim_start().to_lowercase().starts_with("<!doctype"));
+
+        let out = patch_slide(&c, &json!({"index": 0, "op": "append_html", "html": r#"<p id="c2">kedua</p>"#})).await;
+        assert!(out.deck.is_some(), "{}", out.content);
+        let stored = db.get_deck(&deck_id).unwrap();
+        assert!(stored.slides[0].html.contains("kedua"), "{}", stored.slides[0].html);
+        assert!(stored.slides[0].html.contains("Baru"), "patch sebelumnya hilang");
+
+        let out = patch_slide(&c, &json!({"index": 0, "op": "remove", "selector": ".sub"})).await;
+        assert!(out.deck.is_some(), "{}", out.content);
+        let stored = db.get_deck(&deck_id).unwrap();
+        assert!(!stored.slides[0].html.contains(r#"<p class="sub">"#), "{}", stored.slides[0].html);
+
+        // Bad input must not clobber the stored slide.
+        let before = db.get_deck(&deck_id).unwrap().slides[0].html.clone();
+        let bad = patch_slide(&c, &json!({"index": 9, "op": "remove", "selector": "#t"})).await;
+        assert!(bad.deck.is_none());
+        assert!(bad.content.starts_with("error:"), "{}", bad.content);
+        let bad = patch_slide(&c, &json!({"index": 0, "op": "set_text", "selector": "#nope", "text": "x"})).await;
+        assert!(bad.deck.is_none());
+        assert!(bad.content.starts_with("error:"), "{}", bad.content);
+        assert_eq!(db.get_deck(&deck_id).unwrap().slides[0].html, before);
+
+        let _ = std::fs::remove_file(path);
+    }
 }
+#[cfg(test)]mod new_asset_tests{
+use super::*;
+#[test]fn assets_resolve_from_current_deck_only(){let p=std::env::temp_dir().join(format!("asset-{}.db",crate::db::new_id("t")));let db=Db::open(p.clone()).unwrap();let asset=Asset {provenance:None,reference_role:String::new(),reference_status:String::new(),id:"one".into(),deck_id:Some("a".into()),name:"test".into(),mime:"image/png".into(),data:"aGVsbG8=".into(),profile:None,created_at:"2026-01-01T00:00:00Z".into()};db.add_asset(&asset).unwrap();let mut ctx=ToolContext{db:&db,deck_id:"a".into(),settings:AppSettings::default()};assert_eq!(resolve_assets(&ctx,"<img src='asset:one'>"),"<img src='data:image/png;base64,aGVsbG8='>");ctx.deck_id="b".into();assert!(resolve_assets(&ctx,"asset:one").starts_with("asset:"));drop(db);let _=std::fs::remove_file(p);}
+#[test]fn tools_match_vision_and_research_settings(){let mut s=AppSettings::default();let tools=tool_specs(&s).to_string();assert!(!tools.contains("review_render"));assert!(tools.contains("import_image"));s.send_references=true;assert!(tool_specs(&s).to_string().contains("review_render"));s.enable_research=false;assert!(!tool_specs(&s).to_string().contains("import_image"));}
+}
+#[cfg(test)]mod compact_asset_tests{use super::*;#[test]fn read_html_keeps_assets_as_ids_not_megabytes(){let p=std::env::temp_dir().join(format!("compact-{}.db",crate::db::new_id("t")));let db=Db::open(p.clone()).unwrap();db.add_asset(&Asset {provenance:None,reference_role:String::new(),reference_status:String::new(),id:"image_1".into(),deck_id:Some("a".into()),name:"image".into(),mime:"image/png".into(),data:"aGVsbG8=".into(),profile:None,created_at:String::new()}).unwrap();let ctx=ToolContext{db:&db,deck_id:"a".into(),settings:AppSettings::default()};let html="<img src=\"data:image/png;base64,aGVsbG8=\">";let compact=compact_asset_html(&ctx,html);assert_eq!(compact,"<img src=\"asset:image_1\">");assert_eq!(resolve_assets(&ctx,&compact),html);drop(db);let _=std::fs::remove_file(p);}}
+
+#[cfg(test)]mod unsupported_image_tests{use super::*;#[test]fn unsupported_formats_have_actionable_non_guessing_fallback(){assert!(unsupported_image_message(b"<?xml version='1.0'?><svg></svg>").contains("SVG belum didukung"));assert!(unsupported_image_message(b"<!doctype html><html>missing</html>").contains("halaman HTML"));assert!(unsupported_image_message(b"invalid").contains("PNG/JPEG/GIF/WebP"));}}
+
+/// Prepare an existing-slide layout candidate without writing the deck/history.
+pub async fn prepare_layout_candidate(ctx:&ToolContext<'_>,name:&str,args:&Value)->Result<(Deck,usize,Slide),String>{
+ let deck=load_or_default(ctx);let index=args["index"].as_u64().ok_or("candidate requires existing index")? as usize;let mut slide=deck.slides.get(index).cloned().ok_or("candidate target missing")?;
+ let raw=resolve_assets(ctx,&arg_str(args,"html"));let (html,_)=localize_remote_images(&raw).await;
+ slide.html=if name=="patch_slide"{apply_patch(&slide.html,&arg_str(args,"op"),&arg_str(args,"selector"),&html,&arg_str(args,"text"))?}else if !html.trim().is_empty(){html}else{return Err("empty candidate".into())};
+ Ok((deck,index,slide))
+}
+
+#[cfg(test)]mod asset_prefix_tests{use super::*;#[test]fn asset_resolution_does_not_replace_prefixes(){let path=std::env::temp_dir().join(format!("prefix-{}.db",crate::db::new_id("t")));let db=Db::open(path.clone()).unwrap();for(id,data)in[("a","first"),("ab","second")]{db.add_asset(&Asset{id:id.into(),deck_id:Some("d".into()),name:"fixture".into(),mime:"image/png".into(),data:data.into(),profile:None,created_at:"".into(),provenance:None,reference_role:"".into(),reference_status:"".into()}).unwrap();}let c=ToolContext{db:&db,deck_id:"d".into(),settings:AppSettings::default()};assert_eq!(resolve_assets(&c,"asset:a asset:ab asset:abc"),"data:image/png;base64,first data:image/png;base64,second asset:abc");drop(db);let _=std::fs::remove_file(path);}}

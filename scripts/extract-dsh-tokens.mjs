@@ -1,6 +1,6 @@
 import { openSync, readSync, fstatSync, closeSync } from "node:fs";
 
-const PATH = "C:\\Users\\david\\AppData\\Local\\Programs\\DeepSeek Harness\\resources\\app.asar";
+const PATH = process.env.DSH_ASAR_PATH;
 const NEEDLE = Buffer.from("--background");
 const CHUNK = 8 * 1024 * 1024;
 

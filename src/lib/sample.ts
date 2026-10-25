@@ -80,7 +80,7 @@ const slide3 = shell(`
 `)
   .replace("%PAGE%", "03 — 04")
   .replace("</body>", `<div class="kicker kicker-a">Tiga kebiasaan</div>
-  <h2 class="lead">Yang bisa lo mulai hari ini.</h2>
+  <h2 class="lead">Yang bisa kamu mulai hari ini.</h2>
   <div class="list">
     <div class="row"><span class="n">01</span><span class="t">Tulis judulnya lebih dulu.<small>Kalau judulnya lemah, tidak ada layout yang bisa menyelamatkan.</small></span></div>
     <div class="row"><span class="n">02</span><span class="t">Pilih satu aksen, bukan lima.<small>Satu warna yang dipakai dengan disiplin lebih berani daripada pelangi.</small></span></div>

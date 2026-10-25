@@ -163,3 +163,11 @@ radii. The artboard is the only loud thing on screen.
 - Animation in slides — export is a still image, so motion would be a lie.
 - Bundling fonts per project — slides must render identically offline, so only
   system fonts are allowed.
+
+## Current workspace and validation
+
+The board supports cursor-anchored wheel zoom, Space-drag pan, Fit and direct text editing. Artboards use sequence layout rather than free positioning. Existing HTML stays visible while an updated preview loads.
+
+Rendered layout checks are revision-matched. Missing, stale or residual findings keep a change review-required. Candidate revisions must be isolated and measured before replacing their target; rejected candidates do not silently overwrite later user edits. Mechanical overlap checks do not prove copy quality or visual taste.
+
+Provider and account capabilities are described in `docs/PROVIDERS.md` and `docs/ACCOUNT-ROUTES.md`. Do not turn an unfinished account route into an enabled login button.

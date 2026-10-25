@@ -4,15 +4,15 @@
   "version": "0.1.0",
   "identifier": "com.desel.carousel",
   "build": {
-    "beforeDevCommand": "npm run dev:vite",
+    "beforeDevCommand": "npm run prepare:runtime && npm run dev:vite",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build:vite",
+    "beforeBuildCommand": "npm run prepare:runtime && npm run build:vite",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "Desel — Carousel Studio",
+        "title": "Desel \u2014 Carousel Studio",
         "width": 1440,
         "height": 920,
         "minWidth": 1080,
@@ -28,13 +28,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "resources": [
+      "binaries/*",
+      "licenses/*"
     ]
   }
 }
