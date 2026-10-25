@@ -49,3 +49,6 @@ src-tauri/binaries/*
 /scripts/test-review-regression-ui.mjs
 /scripts/test-geometry.mjs
 /scripts/test-layout-candidate.mjs
+
+# Standalone core harness build outputs
+scripts/core-tests/target/

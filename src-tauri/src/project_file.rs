@@ -11,6 +11,9 @@ pub struct ProjectPayload {
     pub deck: Deck,
     pub assets: Vec<Asset>,
     pub comments: Vec<Comment>,
+    /// Creator workspace (draft, queue, memory, locked slides). Optional so older files still import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<serde_json::Value>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -107,6 +110,9 @@ fn validate(p: &ProjectPayload) -> Result<(), String> {
             }
         }
     }
+    if let Some(w) = &p.workspace {
+        Db::check_creator_workspace(w)?;
+    }
     let mut comment_ids = std::collections::HashSet::new();
     for c in &p.comments {
         if c.id.is_empty()
@@ -123,10 +129,12 @@ fn validate(p: &ProjectPayload) -> Result<(), String> {
 }
 pub fn export(db: &Db, id: &str) -> Result<String, String> {
     let (deck, assets, comments) = db.portable_snapshot(id)?;
+    let workspace = db.creator_workspace(id);
     let payload = ProjectPayload {
         deck,
         assets,
         comments,
+        workspace,
     };
     validate(&payload)?;
     let file = ProjectFile {
@@ -157,10 +165,12 @@ pub fn import(db: &Db, text: &str) -> Result<Deck, String> {
 }
 pub fn duplicate(db: &Db, id: &str) -> Result<Deck, String> {
     let (deck, assets, comments) = db.portable_snapshot(id)?;
+    let workspace = db.creator_workspace(id);
     let mut p = ProjectPayload {
         deck,
         assets,
         comments,
+        workspace,
     };
     p.deck.title = format!("{} (copy)", p.deck.title);
     clone_payload(db, p)
@@ -222,8 +232,28 @@ fn clone_payload(db: &Db, mut p: ProjectPayload) -> Result<Deck, String> {
     }
 
     db.import_project_atomic(&p.deck, &p.assets, &p.comments)?;
+    if let Some(mut w) = p.workspace.take() {
+        // Locked slide IDs follow the new slide IDs; unknown ones are dropped.
+        let locked: Vec<serde_json::Value> = w["lockedSlideIds"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().and_then(|id| remap.get(id)).map(|n| serde_json::Value::String(n.clone()))).collect())
+            .unwrap_or_default();
+        w["lockedSlideIds"] = serde_json::Value::Array(locked);
+        // Object locks follow the same slide remap; locks to unknown slides drop.
+        if let Some(objects) = w.get("lockedObjects").and_then(|v| v.as_array()) {
+            let mapped: Vec<serde_json::Value> = objects.iter().filter_map(|o| {
+                let new_id = remap.get(o["slideId"].as_str()?)?.clone();
+                let mut o = o.clone();
+                o["slideId"] = serde_json::Value::String(new_id);
+                Some(o)
+            }).collect();
+            w["lockedObjects"] = serde_json::Value::Array(mapped);
+        }
+        db.save_creator_workspace(&p.deck.id, &w)?;
+    }
     Ok(p.deck)
 }
+#[cfg(not(desel_harness))]
 #[tauri::command]
 pub fn export_project(
     state: tauri::State<'_, crate::commands::AppState>,
@@ -231,6 +261,7 @@ pub fn export_project(
 ) -> Result<String, String> {
     export(&state.db, &deck_id)
 }
+#[cfg(not(desel_harness))]
 #[tauri::command]
 pub fn import_project(
     state: tauri::State<'_, crate::commands::AppState>,
@@ -274,6 +305,7 @@ mod tests {
             deck: deck(),
             assets: vec![],
             comments: vec![],
+            workspace: None,
         };
         p.deck.slides[0].html = "<img onerror='steal()'>".into();
         assert!(validate(&p).is_err());
@@ -348,7 +380,7 @@ mod validation_tests {
     use super::*;
     #[test]
     fn charset_metadata_allowed_but_active_payloads_and_missing_assets_rejected() {
-        let mut p=ProjectPayload{deck:serde_json::from_value(serde_json::json!({"id":"d","slides":[{"id":"s","html":"<!doctype html><html><head><meta charset='utf-8'></head><body>Hi</body></html>"}]})).unwrap(),assets:vec![],comments:vec![]};
+        let mut p=ProjectPayload{deck:serde_json::from_value(serde_json::json!({"id":"d","slides":[{"id":"s","html":"<!doctype html><html><head><meta charset='utf-8'></head><body>Hi</body></html>"}]})).unwrap(),assets:vec![],comments:vec![],workspace:None};
         assert!(validate(&p).is_ok());
         for html in [
             "<script>alert(1)</script>",
@@ -387,12 +419,19 @@ mod duplication_tests {
     }
 }
 
+#[cfg(not(desel_harness))]
 #[tauri::command]
 pub fn save_recovery_copy(
     state: tauri::State<'_, crate::commands::AppState>,
     deck: Deck,
 ) -> Result<Deck, String> {
-    let (_, assets, comments) = state.db.portable_snapshot(&deck.id)?;
+    recovery_copy(&state.db, deck)
+}
+
+/// Preserve the complete local workspace when saving an unsaved deck snapshot.
+pub fn recovery_copy(db: &Db, deck: Deck) -> Result<Deck, String> {
+    let (_, assets, comments) = db.portable_snapshot(&deck.id)?;
+    let workspace = db.creator_workspace(&deck.id);
     let ids: std::collections::HashSet<_> = deck.slides.iter().map(|s| s.id.as_str()).collect();
     let comments = comments
         .into_iter()
@@ -402,9 +441,10 @@ pub fn save_recovery_copy(
         deck,
         assets,
         comments,
+        workspace,
     };
     p.deck.title = format!("{} (local recovery)", p.deck.title);
-    clone_payload(&state.db, p)
+    clone_payload(db, p)
 }
 
 #[cfg(test)]
@@ -438,6 +478,7 @@ mod image_boundary_tests {
             deck,
             assets: vec![asset, b],
             comments: vec![],
+            workspace: None,
         };
         assert!(validate(&p).is_ok());
         p.assets[0].mime = "image/jpeg".into();
@@ -459,6 +500,7 @@ mod image_boundary_tests {
             deck: restored,
             assets: vec![],
             comments: vec![],
+            workspace: None,
         };
         giant.deck.slides[0].html = "<img src='asset:huge'>".repeat(60);
         let mut a = db.list_assets(&giant.deck.id).first().unwrap().clone();
@@ -479,3 +521,37 @@ pub fn template_snapshot(db:&Db,deck:&Deck)->Result<Deck,String>{
 }
 #[cfg(test)]mod template_asset_tests{use super::*;use serde_json::json;
 #[test]fn template_pixels_survive_source_deletion_and_missing_refs_reject(){let p=std::env::temp_dir().join(format!("template-assets-{}",new_id("t")));let db=Db::open(p.clone()).unwrap();let d:Deck=serde_json::from_value(json!({"id":"d","slides":[{"id":"s","html":"<img src='asset:a'>"}]})).unwrap();db.save_deck(&d,None).unwrap();let a:Asset=serde_json::from_value(json!({"id":"a","deckId":"d","mime":"image/png","data":"aW1hZ2U="})).unwrap();db.add_asset(&a).unwrap();let snapshot=template_snapshot(&db,&d).unwrap();assert!(snapshot.slides[0].html.contains("data:image/png;base64,aW1hZ2U="));db.delete_deck("d").unwrap();assert!(snapshot.slides[0].html.contains("data:image/png"));assert!(template_snapshot(&db,&d).is_err());drop(db);let _=std::fs::remove_file(p);}}
+
+#[cfg(test)]
+mod workspace_transfer_tests {
+    use super::*;
+    #[test]
+    fn workspace_travels_with_project_and_remaps_locks() {
+        let db = Db::open(std::env::temp_dir().join(format!("desel-wst-{}.db", uuid::Uuid::new_v4()))).unwrap();
+        let d: Deck = serde_json::from_value(serde_json::json!({"id":"o","slides":[{"id":"s1","html":"<body>a</body>"},{"id":"s2","html":"<body>b</body>"}]})).unwrap();
+        db.save_deck(&d, None).unwrap();
+        db.save_creator_workspace("o", &serde_json::json!({"draft":"hi","queue":[{"id":"q"}],"memory":[{"id":"m"}],"lockedSlideIds":["s1","ghost"],"lockedObjects":[{"slideId":"s1","selector":"#card","label":"Kartu"},{"slideId":"ghost","selector":"#x","label":""}]})).unwrap();
+        let text = export(&db, "o").unwrap();
+        let copy = import(&db, &text).unwrap();
+        let w = db.creator_workspace(&copy.id).unwrap();
+        assert_eq!(w["lockedObjects"].as_array().unwrap().len(), 1);
+        assert_eq!(w["lockedObjects"][0]["slideId"], copy.slides[0].id.as_str());
+        assert_eq!(w["lockedObjects"][0]["selector"], "#card");
+        assert_eq!(w["memory"][0]["id"], "m");
+        assert_eq!(w["lockedSlideIds"].as_array().unwrap().len(), 1);
+        assert_eq!(w["lockedSlideIds"][0], copy.slides[0].id.as_str());
+        // tampered workspace fails checksum; bad shape fails before any project is created
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["payload"]["workspace"]["draft"] = "x".into();
+        let n = db.list_decks().len();
+        assert!(import(&db, &v.to_string()).is_err());
+        assert_eq!(db.list_decks().len(), n);
+        // legacy file without a workspace still imports
+        let db2 = Db::open(std::env::temp_dir().join(format!("desel-wst-{}.db", uuid::Uuid::new_v4()))).unwrap();
+        db2.save_deck(&d, None).unwrap();
+        let legacy = export(&db2, "o").unwrap();
+        assert!(!legacy.contains("workspace"));
+        let c2 = import(&db2, &legacy).unwrap();
+        assert!(db2.creator_workspace(&c2.id).is_none());
+    }
+}

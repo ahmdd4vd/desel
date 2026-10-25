@@ -1,3 +1,10 @@
+import {ProductionReview} from "./components/ProductionReview";
+import {productionBundle} from "./lib/production-bundle";
+import {CreatorMemory} from "./components/CreatorMemory";
+import {CreatorRuns} from "./components/CreatorRuns";
+import {ChatMarkdown} from "./components/ChatMarkdown";
+import {useCreatorWorkspace} from "./hooks/useCreatorWorkspace";
+import type {ChatScope} from "./lib/creator-workspace";
 import {useDialogFocus} from "./hooks/useDialogFocus";
 import {createAssetCopySaver} from './lib/asset-copy';
 import {inspectExport,exportRevision,type ExportPreflight} from "./lib/export-preflight";
@@ -70,9 +77,12 @@ import {
   type TemplateRecord,
   type ToolCallRecord,
 } from "./lib/types";
+import { reflowSlideHtml } from "./lib/reflow";
+import { buildVariantProjects } from "./lib/variant-package";
 import Canvas from "./components/Canvas";
 import Board from "./components/Board";
 import { useStudio } from "./state/studio";
+import { activeMessages, siblings } from "./lib/chat-branches";
 
 type LeftTab = "chat" | "projects" | "templates";
 type RightTab = "design" | "source" | "notes";
@@ -82,9 +92,6 @@ type Turn =
   | { kind: "user"; id: string; text: string }
   | { kind: "agent"; id: string; text: string; reasoning:string; steps: ToolCallRecord[] };
 
-function ChatText({text}:{text:string}) {
-  return <>{text.split(/(`[^`]+`)/g).map((part,i) => part.startsWith("`") && part.endsWith("`") ? <code key={i}>{part.slice(1,-1)}</code> : <span key={i}>{part}</span>)}</>;
-}
 
 function buildTurns(messages: ChatMessage[]): Turn[] {
   const turns: Turn[] = [];
@@ -262,7 +269,9 @@ export default function App() {
   const deck = useStudio((s) => s.deck);
   const decks = useStudio((s) => s.decks);
   const templates = useStudio((s) => s.templates);
-  const messages = useStudio((s) => s.messages);
+  const allMessages = useStudio((s) => s.messages);
+  const branches = useStudio((s) => s.branches);
+  const messages = useMemo(() => activeMessages(branches, allMessages), [branches, allMessages]);
 
   /** Persisted tool replies, so finished turns can still show what the agent did. */
   const toolResults = useMemo(() => {
@@ -304,6 +313,7 @@ export default function App() {
   const stepHistory=useStudio(s=>s.stepHistory);
   const refreshHistory=useStudio(s=>s.refreshHistory);
   useEffect(()=>{void refreshHistory();},[deck.id,refreshHistory]);
+  useEffect(()=>{void useStudio.getState().refreshBranches();},[deck.id,allMessages.length===0]);
   const saveDeck = useStudio((s) => s.saveDeck);
   const updateDeck = useStudio((s) => s.updateDeck);
   const selectSlide = useStudio((s) => s.selectSlide);
@@ -356,7 +366,19 @@ export default function App() {
   const [inspector, setInspector] = useState(false);
   const [mobilePane,setMobilePane]=useState<"chat"|"canvas">("canvas");
   const [view, setView] = useState<"board" | "focus">("focus");
-  const [draft, setDraft] = useState("");
+  const creatorError=useCallback((text:string)=>useStudio.getState().notify("error",text),[]);
+  const {workspace:creator,update:updateCreator,storageError:creatorStorageError}=useCreatorWorkspace(deck.id,creatorError);
+  const draft=creator.draft;
+  const setDraft=useCallback((value:string|((current:string)=>string))=>{updateCreator(c=>({...c,draft:typeof value==='function'?value(c.draft):value}));},[updateCreator]);
+  const [chatQuery,setChatQuery]=useState("");
+  const [scopeSelected,setScopeSelected]=useState(false);
+  const [scopeAsset,setScopeAsset]=useState("");
+  const [objectContext,setObjectContext]=useState<ChatScope['objectContext']>();
+  const [includeObject,setIncludeObject]=useState(false);
+  useEffect(()=>{setObjectContext(undefined);setIncludeObject(false);},[deck.id,selectedSlideId]);
+  const [jumpVisible,setJumpVisible]=useState(false);
+  const sendLock=useRef(false);
+  useEffect(()=>{setChatQuery("");setScopeSelected(false);setScopeAsset("");},[deck.id]);
   const [pinning, setPinning] = useState(false);
   const [pinAt, setPinAt] = useState<{ x: number; y: number; selector: string;deckId:string;slideId:string } | null>(null);
   const [pinText, setPinText] = useState("");
@@ -379,6 +401,9 @@ export default function App() {
   const [ackExport,setAckExport]=useState(false);
   const checkExport=async()=>{setCheckingExport(true);setAckExport(false);setPreflight(null);try{const result=await inspectExport(deck,frames.current);if(exportRevision(useStudio.getState().deck)===result.revision)setPreflight(result);}catch(err){notify("error",`Pemeriksaan ekspor gagal: ${String(err)}`);}finally{setCheckingExport(false);}};
   const [exportCaption, setExportCaption] = useState(true);
+  const [exportBundle,setExportBundle]=useState(true);
+  const [exportVariants,setExportVariants]=useState(false);
+  const downloadBrief=()=>{try{for(const file of productionBundle(deck,references,creator)){const url=URL.createObjectURL(new Blob([file.data],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=file.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}notify('ok','Brief dan manifest diunduh. Catatan sumber bukan verifikasi izin.');}catch(e){notify('error',String(e));}};
   const [exporting, setExporting] = useState(false);
   const exportingRef=useRef(false);
   const closeExport=()=>{if(!exportingRef.current)setExportOpen(false)};
@@ -516,16 +541,28 @@ export default function App() {
     return () => document.removeEventListener("pointerdown",close);
   },[menuOpen]);
 
-  const send = useCallback(async () => {
-    const text = draft.trim();
-    if (!text || busy) return;
-    followingChat.current = true;
-    setDraft("");
-    if (composerRef.current) composerRef.current.style.height = "auto";
-    const sent = await sendMessage(text);
-    if (!sent) setDraft(current => current || text);
-    void refreshRevisions();
-  }, [draft, busy, sendMessage, refreshRevisions]);
+  const currentScope=():ChatScope=>({mode:creator.mode,slideId:scopeSelected?selectedSlideId??undefined:undefined,objectContext:includeObject&&objectContext?.slideId===selectedSlideId?objectContext:undefined,assetIds:scopeAsset?[scopeAsset]:[],lockedSlideIds:creator.lockedSlideIds,lockedObjects:creator.lockedObjects});
+  const toggleObjectLock=(obj:{slideId:string;selector:string;label:string})=>{updateCreator(c=>{const has=c.lockedObjects.some(o=>o.slideId===obj.slideId&&o.selector===obj.selector);return{...c,lockedObjects:has?c.lockedObjects.filter(o=>!(o.slideId===obj.slideId&&o.selector===obj.selector)):[...c.lockedObjects,obj]};});};
+  const send = async () => {
+    const text=draft.trim();if(!text||sendLock.current||creatorStorageError)return;
+    const scope=currentScope();
+    if(scope.mode==='edit'&&scope.slideId&&scope.lockedSlideIds.includes(scope.slideId)){notify("error","Slide konteks terkunci. Buka kunci sebelum mengedit.");return;}
+    if(scope.mode==='edit'&&!scope.slideId){notify("error","Pilih slide lalu aktifkan konteks slide untuk mode Edit.");return;}
+    if(busy){updateCreator(c=>({...c,draft:'',queue:[...c.queue,{id:crypto.randomUUID(),text,scope,createdAt:new Date().toISOString()}]}));return;}
+    sendLock.current=true;followingChat.current=true;
+    if(!updateCreator(c=>({...c,draft:''}))){sendLock.current=false;return;}
+    if(composerRef.current)composerRef.current.style.height='auto';
+    const sourceId=deck.id;
+    try{const sent=await sendMessage(text,{...scope,memory:creator.memory});if(!sent){updateCreator(c=>({...c,draft:c.draft||text}));}if(useStudio.getState().deck.id===sourceId)void refreshRevisions();}
+    finally{sendLock.current=false;}
+  };
+  const runQueued=async(id:string)=>{
+    if(busy||sendLock.current)return;const item=creator.queue.find(q=>q.id===id);if(!item)return;
+    sendLock.current=true;
+    try{const ok=await sendMessage(item.text,{...item.scope,memory:creator.memory});if(ok)updateCreator(c=>({...c,queue:c.queue.filter(q=>q.id!==id)}));}
+    finally{sendLock.current=false;}
+  };
+  const copyChat=async(text:string)=>{try{await navigator.clipboard.writeText(text);notify("ok","Pesan disalin.");}catch{notify("error","Clipboard tidak tersedia. Pilih teks untuk menyalin.");}};
 
   // Geometry lints (overlap) need a rendered layout, so measure the offscreen
   // preview iframes after each slide change settles and merge with string lints.
@@ -595,7 +632,7 @@ export default function App() {
       const partialSlides: number[] = [];
 
       const verifySnapshot=()=>{if(exportRevision(useStudio.getState().deck)!==preflight.revision)throw Error("Proyek berubah selama ekspor. File belum dikirim; periksa versi terbaru lalu ekspor ulang.");};
-      for (const { slide, index } of visible) {
+      for (const { slide, index } of (exportPng||exportPdf)?visible:[]) {
         verifySnapshot();
         const frame = frames.current[index];
         const body = frame?.contentDocument?.body;
@@ -672,7 +709,7 @@ export default function App() {
       }
 
       verifySnapshot();
-      if (!pngs.length) throw new Error("Tidak ada slide yang berhasil diekspor.");
+      if ((exportPng||exportPdf) && !pngs.length) throw new Error("Tidak ada slide yang berhasil diekspor.");
 
       if (exportCaption) {
         const caption = [
@@ -685,7 +722,16 @@ export default function App() {
         files.push({ name: "caption.txt", encoding: "utf8", data: caption });
       }
 
-      files.push({name:"export-summary.txt",encoding:"utf8",data:[`Desel export: ${deck.title}`,`Size: ${size.w}x${size.h}`,`Exported slide numbers: ${visible.filter(v=>!skippedSlides.includes(v.index+1)).map(v=>v.index+1).join(', ')}`,`Skipped slides: ${skippedSlides.join(', ')||'none'}`,`Slides without remote images: ${partialSlides.join(', ')||'none'}`,"Mechanical checks are not visual/content/rights approval."].join("\n")});
+      if(exportBundle)files.push(...productionBundle(deck,references,creator));
+      let variantNote="Platform variants: not requested";
+      if(exportVariants){
+        verifySnapshot();
+        const variants=await buildVariantProjects(useStudio.getState().deck,references.filter(a=>a.deckId===deck.id),comments,creator);
+        for(const v of variants)files.push({name:v.fileName,encoding:"utf8",data:v.text});
+        const kept=variants.reduce((n,v)=>n+v.keptOriginal,0);
+        variantNote=`Platform variants: ${variants.length} editable .desel.json files (${variants.map(v=>v.aspect).join(', ')}) - scaled starting variants for review, not redesigns${kept?`; ${kept} slide(s) kept original html (no usable document)`:""}`;
+      }
+      files.push({name:"export-summary.txt",encoding:"utf8",data:[`Desel export: ${deck.title}`,`Size: ${size.w}x${size.h}`,`Exported slide numbers: ${visible.filter(v=>!skippedSlides.includes(v.index+1)).map(v=>v.index+1).join(', ')}`,`Skipped slides: ${skippedSlides.join(', ')||'none'}`,`Slides without remote images: ${partialSlides.join(', ')||'none'}`,variantNote,"Mechanical checks are not visual/content/rights approval."].join("\n")});
       const dir = await api.exportDefaultDir(slug(deck.title || "desel"));
       verifySnapshot();
       const result = await api.writeExport(dir, files, settings.exportDir);
@@ -717,7 +763,7 @@ export default function App() {
   }
 
   return (
-    <>{projectReviewOpen&&<ProjectReview deck={deck} comments={comments} onOpen={(slideId,commentId)=>{selectSlide(slideId);setActiveComment(commentId);setView("focus");setRight("notes");setInspector(true)}} onStatus={setCommentStatus} onClose={()=>setProjectReviewOpen(false)}/>} {aspectChange&&<AspectChange from={aspectChange.from} to={aspectChange.to} slide={selected} onCancel={()=>setAspectChange(null)} onConfirm={()=>{if(deck.id!==aspectChange.deckId||deck.aspect!==aspectChange.from){notify("error","Proyek/format berubah. Tinjau kembali sebelum menerapkan.");setAspectChange(null);return}updateDeck({aspect:aspectChange.to});setAspectChange(null)}}/>} {slideSearchOpen&&<SlideSearch deck={deck} onSelect={id=>{selectSlide(id);setView("focus")}} onClose={()=>setSlideSearchOpen(false)}/>} {organizerOpen&&<SlideOrganizer deck={deck} selectedId={selected?.id??null} onSelect={selectSlide} onMove={moveSlide} onDuplicate={duplicateSlide} onDelete={deleteSlide} onVisibility={(id,hidden)=>updateSlide(id,{hidden})} onAdd={addSlide} onClose={()=>setOrganizerOpen(false)}/>} {deleteRequest&&<div className="overlay"><div ref={deletionDialog} className="modal delete-confirm" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><div className="modal-head"><h2 id="delete-title">Hapus {deleteRequest.kind==="project"?"proyek":"template"}?</h2></div><p className="delete-item-name">{deleteRequest.title}</p><p className="modal-sub">{deleteRequest.kind==="project"?"Proyek, chat, catatan, aset lokal dan riwayatnya dihapus. Tindakan ini tidak dapat dibatalkan melalui Undo. Buat backup sebelum melanjutkan jika masih diperlukan.":"Template dihapus dari pustaka. Proyek yang dibuat dari template ini tetap ada. Penghapusan tidak dapat dibatalkan."}</p>{deleteError&&<p className="model-error">{deleteError}</p>}<div className="modal-actions"><button autoFocus disabled={deleting} className="btn btn-sm" onClick={()=>setDeleteRequest(null)}>Batal</button><button className="btn btn-sm danger" disabled={deleting||busy} onClick={async()=>{if(deletingRef.current)return;deletingRef.current=true;setDeleting(true);setDeleteError("");try{if(deleteRequest.kind==="project")await deleteDeck(deleteRequest.id);else await deleteTemplate(deleteRequest.id);setDeleteRequest(null)}catch(err){setDeleteError(String(err))}finally{deletingRef.current=false;setDeleting(false)}}}>{deleting?"Menghapus...":"Hapus permanen"}</button></div></div></div>}{presenting&&<Presentation deck={deck} initialId={selected?.id??null} onClose={()=>setPresenting(false)}/>}<div className={`app clean-preview ${view === "board" ? "view-board" : "view-focus"}`}>
+    <>{projectReviewOpen&&<ProjectReview deck={deck} comments={comments} onOpen={(slideId,commentId)=>{selectSlide(slideId);setActiveComment(commentId);setView("focus");setRight("notes");setInspector(true)}} onStatus={setCommentStatus} onClose={()=>setProjectReviewOpen(false)}/>} {aspectChange&&<AspectChange from={aspectChange.from} to={aspectChange.to} slide={selected} onCancel={()=>setAspectChange(null)} onConfirm={()=>{if(deck.id!==aspectChange.deckId||deck.aspect!==aspectChange.from){notify("error","Proyek/format berubah. Tinjau kembali sebelum menerapkan.");setAspectChange(null);return}updateDeck({aspect:aspectChange.to});setAspectChange(null)}} onReflow={()=>{if(deck.id!==aspectChange.deckId||deck.aspect!==aspectChange.from){notify("error","Proyek/format berubah. Tinjau kembali sebelum menerapkan.");setAspectChange(null);return}const fromSize=aspectSize(aspectChange.from),toSize=aspectSize(aspectChange.to);const reflowed=deck.slides.map(s=>({...s,html:reflowSlideHtml(s.html,fromSize,toSize)??s.html}));updateDeck({aspect:aspectChange.to,slides:reflowed});notify("info","Varian terskala dibuat. Konten asli utuh di dalam bingkai; tinjau tiap slide.");setAspectChange(null)}}/>} {slideSearchOpen&&<SlideSearch deck={deck} onSelect={id=>{selectSlide(id);setView("focus")}} onClose={()=>setSlideSearchOpen(false)}/>} {organizerOpen&&<SlideOrganizer deck={deck} selectedId={selected?.id??null} onSelect={selectSlide} onMove={moveSlide} onDuplicate={duplicateSlide} onDelete={deleteSlide} onVisibility={(id,hidden)=>updateSlide(id,{hidden})} onAdd={addSlide} onClose={()=>setOrganizerOpen(false)}/>} {deleteRequest&&<div className="overlay"><div ref={deletionDialog} className="modal delete-confirm" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><div className="modal-head"><h2 id="delete-title">Hapus {deleteRequest.kind==="project"?"proyek":"template"}?</h2></div><p className="delete-item-name">{deleteRequest.title}</p><p className="modal-sub">{deleteRequest.kind==="project"?"Proyek, chat, catatan, aset lokal dan riwayatnya dihapus. Tindakan ini tidak dapat dibatalkan melalui Undo. Buat backup sebelum melanjutkan jika masih diperlukan.":"Template dihapus dari pustaka. Proyek yang dibuat dari template ini tetap ada. Penghapusan tidak dapat dibatalkan."}</p>{deleteError&&<p className="model-error">{deleteError}</p>}<div className="modal-actions"><button autoFocus disabled={deleting} className="btn btn-sm" onClick={()=>setDeleteRequest(null)}>Batal</button><button className="btn btn-sm danger" disabled={deleting||busy} onClick={async()=>{if(deletingRef.current)return;deletingRef.current=true;setDeleting(true);setDeleteError("");try{if(deleteRequest.kind==="project")await deleteDeck(deleteRequest.id);else await deleteTemplate(deleteRequest.id);setDeleteRequest(null)}catch(err){setDeleteError(String(err))}finally{deletingRef.current=false;setDeleting(false)}}}>{deleting?"Menghapus...":"Hapus permanen"}</button></div></div></div>}{presenting&&<Presentation deck={deck} initialId={selected?.id??null} onClose={()=>setPresenting(false)}/>}<div className={`app clean-preview ${view === "board" ? "view-board" : "view-focus"}`}>
       {busy && <div className="progress-line" />}
       {recoverableDraft&&<div className="draft-recovery-banner" role="status"><span>Draft lokal belum tersimpan ditemukan: {recoverableDraft.deck.title||"Tanpa judul"}. Pulihkan sebagai proyek baru, tanpa menimpa database.</span><button disabled={busy||recoveringDraft} onClick={()=>void recoverLocalDraft()}>{recoveringDraft?"Memulihkan draft...":"Pulihkan salinan draft"}</button><button disabled={recoveringDraft} onClick={dismissLocalDraft}>Abaikan draft</button></div>}
       {saveState==="error"&&<div className="save-error-banner" role="alert"><span>Perubahan belum tersimpan. Edit lokal tetap ada di canvas.{saveError?` ${saveError}`:""}</span><button onClick={()=>void saveDeck().catch(()=>undefined)}>Coba simpan</button><button disabled={busy||savingRecoveryCopy} onClick={()=>void saveRecoveryCopy()}>{savingRecoveryCopy?"Menyimpan salinan...":"Simpan salinan pemulihan"}</button></div>}
@@ -789,7 +835,8 @@ export default function App() {
 
           {left === "chat" && (
             <div className="chat">
-              <div className="chat-log" ref={logRef} onScroll={e => {const el=e.currentTarget;followingChat.current=el.scrollHeight-el.clientHeight-el.scrollTop<90;}}>
+              <div className="chat-toolbar"><Search size={13}/><input aria-label="Cari percakapan" placeholder="Cari percakapan…" value={chatQuery} onChange={e=>setChatQuery(e.target.value)}/><span>CREATOR STUDIO</span></div>
+              <div className="chat-log" ref={logRef} onScroll={e => {const el=e.currentTarget;followingChat.current=el.scrollHeight-el.clientHeight-el.scrollTop<90;setJumpVisible(!followingChat.current);}}>
                 {messages.length === 0 && !deck.slides.length && (
                   <div className="chat-hello">
                     <h2>
@@ -842,12 +889,12 @@ export default function App() {
                 )}
 
                 {messages.length === 0 && deck.slides.length > 0 && <div className="chat-context"><span className="context-eyebrow">ASISTEN DESAIN</span><h2>Lanjutkan dari sini.</h2><p>{deck.slides.length} slide sudah ada di canvas. Pilih slide untuk edit langsung, atau minta perubahan lewat chat.</p><button className="context-action" onClick={() => setDraft("Tinjau deck ini. Sebutkan masalah desain tanpa mengubah slide dulu.")}>Tinjau desain <ArrowRight size={14}/></button></div>}
-                {turns.map((t) =>
+                {turns.filter(t=>!chatQuery||t.text.toLowerCase().includes(chatQuery.toLowerCase())).map((t) =>
                   t.kind === "user" ? (
                     <div className="msg user" key={t.id}>
                       <div className="msg-avatar">K</div>
                       <div className="msg-text">
-                        <p><ChatText text={t.text}/></p>
+                        <ChatMarkdown text={t.text}/><div className="chat-actions"><button title="Salin pesan" onClick={()=>void copyChat(t.text)}>Salin</button><button title="Kutip ke draft" onClick={()=>setDraft(d=>(d?d+'\n\n':'')+t.text.split('\n').map(line=>'> '+line).join('\n')+'\n\n')}>Kutip</button><button title="Gunakan sebagai brief baru; riwayat tetap utuh" onClick={()=>setDraft(t.text)}>Pakai lagi</button><button className="branch-fork" title="Edit dan kirim ulang sebagai cabang baru; cabang lama tetap tersimpan dan tidak dilihat agent" onClick={()=>{void useStudio.getState().forkAtMessage(t.id).then(ok=>{if(ok)setDraft(t.text)})}}>Cabang baru</button>{(()=>{const sib=siblings(branches,t.id);if(sib.length<2)return null;const i=sib.indexOf(t.id);return <span className="branch-switch" aria-label="Cabang percakapan"><button aria-label="Cabang sebelumnya" disabled={i<=0} onClick={()=>void useStudio.getState().switchBranch(sib[i-1])}>‹</button><span>{i+1}/{sib.length}</span><button aria-label="Cabang berikutnya" disabled={i>=sib.length-1} onClick={()=>void useStudio.getState().switchBranch(sib[i+1])}>›</button></span>})()}</div>
                       </div>
                     </div>
                   ) : (
@@ -857,7 +904,7 @@ export default function App() {
                       </div>
                       <div className="msg-text">
                         {t.reasoning && <details className="provider-reasoning"><summary>Thinking - output provider</summary><p>{t.reasoning}</p></details>}
-                        {t.text && <p><ChatText text={t.text}/></p>}
+                        {t.text && <><ChatMarkdown text={t.text}/><div className="chat-actions"><button title="Salin pesan" onClick={()=>void copyChat(t.text)}>Salin</button><button title="Kutip ke draft" onClick={()=>setDraft(d=>(d?d+'\n\n':'')+t.text.split('\n').map(line=>'> '+line).join('\n')+'\n\n')}>Kutip</button><button title="Gunakan sebagai brief baru; riwayat tetap utuh" onClick={()=>setDraft(t.text)}>Pakai lagi</button>{(()=>{const idx=turns.findIndex(x=>x.id===t.id);let prev:typeof turns[number]|undefined;for(let i=idx-1;i>=0;i--){if(turns[i].kind==="user"){prev=turns[i];break}}if(!prev)return null;const u=prev;return <button className="branch-fork retry-reply" title="Ulangi balasan ini: buka cabang baru dari pesan lo sebelumnya dan isi ulang draft. Belum terkirim; lo yang kirim." onClick={()=>{void useStudio.getState().forkAtMessage(u.id).then(ok=>{if(ok)setDraft(u.text)})}}>Ulangi balasan</button>})()}</div></>}
                         {t.steps.length > 0 && (
                           <details className="step-group">
                             <summary>
@@ -1037,7 +1084,23 @@ export default function App() {
                 />
               </div>
 
+              {jumpVisible&&<button className="chat-jump" onClick={()=>{followingChat.current=true;setJumpVisible(false);if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;}}>Ke pesan terbaru ↓</button>}
+              <div className="creator-workbench">
+                <CreatorMemory key={deck.id} memory={creator.memory} update={updateCreator}/>
+                <CreatorRuns deckId={deck.id} busy={busy} onContinue={setDraft}/>
+                <ProductionReview key={'production-'+deck.id} workspace={creator} onBrief={text=>{updateCreator(c=>({...c,mode:'discuss',draft:text}));}} onBundle={downloadBrief}/>
+              </div>
               <div className="composer">
+                {creatorStorageError&&<p role="alert">{creatorStorageError}</p>}
+                <div className="creator-scope">
+                  <select aria-label="Mode agent" value={creator.mode} onChange={e=>updateCreator(c=>({...c,mode:e.target.value as ChatScope['mode']}))}><option value="discuss">Diskusi · tanpa edit</option><option value="edit">Edit · slide terpilih</option><option value="produce">Produksi · seluruh deck</option></select>
+                  <label><input type="checkbox" checked={scopeSelected} disabled={!selectedSlideId} onChange={e=>setScopeSelected(e.target.checked)}/> Slide terpilih</label>
+                  {objectContext&&<label title="Konteks objek adalah referensi, bukan kunci region. Mode Edit tetap dibatasi slide."><input type="checkbox" checked={includeObject} onChange={e=>{setIncludeObject(e.target.checked);if(e.target.checked)setScopeSelected(true);}}/> @obj {objectContext.label}</label>}
+                  {scopeSelected&&selectedSlideId&&<span className="scope-chip">@slide {deck.slides.findIndex(s=>s.id===selectedSlideId)+1}</span>}
+                  <select aria-label="Konteks aset" value={scopeAsset} onChange={e=>setScopeAsset(e.target.value)}><option value="">+ Aset konteks</option>{references.map(a=><option key={a.id} value={a.id}>@asset {a.name}</option>)}</select>
+                  {selectedSlideId&&<button title="Kunci slide dari edit agent" className={creator.lockedSlideIds.includes(selectedSlideId)?'active':''} onClick={()=>updateCreator(c=>({...c,lockedSlideIds:c.lockedSlideIds.includes(selectedSlideId!)?c.lockedSlideIds.filter(id=>id!==selectedSlideId):[...c.lockedSlideIds,selectedSlideId!]}))}>{creator.lockedSlideIds.includes(selectedSlideId)?'Terkunci':'Kunci slide'}</button>}
+                </div>
+                {creator.queue.length>0&&<details className="brief-queue" open><summary>Antrean brief · {creator.queue.length} · jalankan setelah review</summary>{creator.queue.map(q=><div key={q.id}><span>{q.text}</span><button disabled={busy} onClick={()=>void runQueued(q.id)}>Jalankan</button><button onClick={()=>updateCreator(c=>({...c,queue:c.queue.filter(item=>item.id!==q.id)}))}>Hapus</button></div>)}</details>}
                 <div className="composer-box">
                   <textarea
                     ref={composerRef}
@@ -1051,13 +1114,14 @@ export default function App() {
                       el.style.height = `${Math.min(el.scrollHeight, 132)}px`;
                     }}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
+                      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                         e.preventDefault();
                         void send();
                       }
                     }}
                   />
                   <div className="composer-foot">
+                    {busy && <button className="queue-send" disabled={!draft.trim()} onClick={()=>void send()}>Antrekan</button>}
                     {busy ? (
                       <button className="send stop" onClick={() => void stopAgent()} title="Hentikan agent">
                         <Square size={13} />
@@ -1293,6 +1357,9 @@ export default function App() {
                 doc={safeDoc(selected.html, size.w, size.h)}
                 assets={references}
                 deckKey={deck.id}
+                onObjectContext={context=>setObjectContext(context??undefined)}
+                objectLocks={creator.lockedObjects.filter(o=>o.slideId===selected.id)}
+                onToggleObjectLock={toggleObjectLock}
                 neighbour={deck.slides.filter(s => !s.hidden && s.id !== selected.id).map(s => ({id:s.id,title:s.title,doc:safeDoc(s.html,size.w,size.h)}))[0]}
                 onSelectNeighbour={id => selectSlide(id)}
                 slideTitle={`Slide ${deck.slides.indexOf(selected)+1} · ${selected.title}` }
@@ -1754,13 +1821,15 @@ export default function App() {
                 <MessageSquare size={16} />
               </label>
             </div>
+            <label className="check"><input type="checkbox" disabled={exporting} checked={exportBundle} onChange={e=>setExportBundle(e.target.checked)}/><span>Production bundle: brief, sumber aset, keputusan dan manifest (tanpa key / akun / chat)</span></label>
+            <label className="check"><input type="checkbox" disabled={exporting} checked={exportVariants} onChange={e=>setExportVariants(e.target.checked)}/><span>Varian platform: file proyek .desel.json editable untuk {ASPECTS.filter(a=>a.id!==deck.aspect).length} format lain (varian terskala, konten asli utuh di dalam bingkai)</span></label>
             <div className="modal-actions">
               <button className="btn btn-ghost btn-sm" disabled={exporting} onClick={closeExport}>
                 Batal
               </button>
               <button
                 className="btn btn-primary btn-sm"
-                disabled={busy||exporting||checkingExport||!preflight||preflight.revision!==exportRevision(deck)||preflight.findings.some(f=>f.severity==="block")||(preflight.findings.length>0&&!ackExport)||(!exportPng && !exportPdf && !exportCaption)}
+                disabled={busy||exporting||checkingExport||!preflight||preflight.revision!==exportRevision(deck)||preflight.findings.some(f=>f.severity==="block")||(preflight.findings.length>0&&!ackExport)||(!exportPng && !exportPdf && !exportCaption && !exportVariants)}
                 onClick={() => void runExport()}
               >
                 {exporting ? <Loader2 size={13} className="spin" /> : <Download size={13} />}

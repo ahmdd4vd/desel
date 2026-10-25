@@ -176,6 +176,31 @@ pub fn list_messages(state: State<'_, AppState>, deck_id: String) -> Vec<ChatMes
 }
 
 #[tauri::command]
+pub fn get_chat_branches(state: State<'_, AppState>, deck_id: String) -> Option<serde_json::Value> {
+    state.db.chat_branches(&deck_id)
+}
+
+#[tauri::command]
+pub fn save_chat_branches(state: State<'_, AppState>, deck_id: String, branches: serde_json::Value) -> Result<(), String> {
+    state.db.save_chat_branches(&deck_id, &branches)
+}
+
+#[tauri::command]
+pub fn get_creator_workspace(state: State<'_, AppState>, deck_id: String) -> Option<serde_json::Value> {
+    state.db.creator_workspace(&deck_id)
+}
+
+#[tauri::command]
+pub fn save_creator_workspace(state: State<'_, AppState>, deck_id: String, workspace: serde_json::Value) -> Result<(), String> {
+    state.db.save_creator_workspace(&deck_id, &workspace)
+}
+
+#[tauri::command]
+pub fn creator_resume_plan(state: State<'_, AppState>, run_id: String) -> Result<serde_json::Value, String> {
+    state.db.creator_resume_plan(&run_id)
+}
+
+#[tauri::command]
 pub fn clear_messages(state: State<'_, AppState>, deck_id: String) -> Result<(), String> {
     state
         .db
@@ -215,7 +240,15 @@ pub async fn send_to_agent(
     deck_id: String,
     text: String,
     channel: Channel<AgentEvent>,
+    context:Option<crate::creator::CreatorRequest>,
 ) -> Result<(), String> {
+    // Reserve before any await, so two invocations cannot race the canvas writer.
+    let cancel=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {let mut map=state.cancel.lock().map_err(|_|"Run lock unavailable")?;if map.contains_key(&deck_id){return Err("Agent masih berjalan pada proyek ini; tidak memulai writer kedua.".into())}map.insert(deck_id.clone(),cancel.clone());}
+    struct Lease<'a>{map:&'a std::sync::Mutex<std::collections::HashMap<String,std::sync::Arc<std::sync::atomic::AtomicBool>>>,id:String}
+    impl Drop for Lease<'_>{fn drop(&mut self){if let Ok(mut m)=self.map.lock(){m.remove(&self.id);}}}
+    let _lease=Lease{map:&state.cancel,id:deck_id.clone()};
+    if let Some(c)=&context{let deck=state.db.get_deck(&deck_id).ok_or("Project missing")?;c.validate(&deck)?;}
     let mut settings = state.db.get_settings();
     crate::provider_runtime::resolve(&app,&mut settings).await?;
 
@@ -244,27 +277,20 @@ pub async fn send_to_agent(
         streaming: false,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    state
-        .db
-        .append_message(&user_msg)
-        .map_err(|e| format!("gagal menyimpan pesan: {e}"))?;
+    let run_id=context.as_ref().and_then(|c|c.run_id.clone()).unwrap_or_else(||new_id("run"));
+    state.db.begin_creator_run(&run_id,&deck_id,&json!({"text":user_msg.content,"context":context}),&user_msg)?;
+    let mut context=context.unwrap_or(crate::creator::CreatorRequest{mode:"produce".into(),..Default::default()});context.run_id=Some(run_id.clone());
 
-    let history = state.db.list_messages(&deck_id);
+    state.db.track_user_turn(&deck_id,&user_msg.id)?;
+    let history = state.db.active_history(&deck_id);
     let geometry = state
         .geometry
         .lock()
         .map(|g| g.get(&deck_id).cloned().unwrap_or_default())
         .unwrap_or_default();
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Ok(mut map) = state.cancel.lock() {
-        map.insert(deck_id.clone(), cancel.clone());
-    }
     let db = &state.db;
-    agent::run_agent(db, &settings, &deck_id, history, geometry, cancel, channel).await;
-    if let Ok(mut map) = state.cancel.lock() {
-        map.remove(&deck_id);
-    }
-
+    agent::run_agent_scoped(db, &settings, &deck_id, history, geometry, cancel, channel,Some(context)).await;
+    state.db.checkpoint_creator_run(&run_id,"settled","Invocation returned. Inspect saved results and review findings before continuing.")?;
     Ok(())
 }
 
@@ -732,3 +758,6 @@ pub fn asset_by_id(state:State<'_,AppState>,deck_id:String,id:String)->Result<As
 #[tauri::command]pub fn list_brands(state:State<'_,AppState>)->Vec<BrandProfile>{state.db.list_brands()}
 #[tauri::command]pub fn save_brand(state:State<'_,AppState>,brand:BrandProfile)->Result<(),String>{state.db.save_brand(&brand)}
 #[tauri::command]pub fn delete_brand(state:State<'_,AppState>,id:String)->Result<(),String>{state.db.delete_brand(&id)}
+
+#[tauri::command]
+pub fn creator_runs(state:State<'_,AppState>,deck_id:String)->Result<Vec<Value>,String>{state.db.creator_runs(&deck_id)}

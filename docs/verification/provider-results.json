@@ -1,0 +1,144 @@
+{"runtime":"Magpie v0.1.1404 (both pinned binary hashes verified; Linux binary executed)","providerGatewayIsolated":[
+  {
+    "test": "provider add",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "gateway model discovery",
+    "pass": true,
+    "detail": "isolated-local/local-test-model"
+  },
+  {
+    "test": "local gateway inference",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "upstream auth failure surfaced",
+    "pass": true,
+    "detail": "401"
+  },
+  {
+    "test": "account use",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "account off",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "account on",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "account remove",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "read /api/plugins",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "read /api/plugins/updates",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "empty plugin update check",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "missing plugin login fails",
+    "pass": true,
+    "detail": "400"
+  },
+  {
+    "test": "provider survives isolated restart",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "ephemeral port changes",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "provider delete persists",
+    "pass": true,
+    "detail": ""
+  }
+],"folderPluginIsolated":[
+  {
+    "test": "initial plugin list empty",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "authored inert local plugin add",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "plugin disable",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "plugin enable",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "local plugin update check",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "local plugin survives restart",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "local plugin remove",
+    "pass": true,
+    "detail": ""
+  }
+],"inertRegistryIsolated":[
+  {
+    "test": "npm add @magpie-community/desel-qualification-fixture@1.0.0",
+    "pass": true,
+    "detail": "1.0.0"
+  },
+  {
+    "test": "npm add @magpie-community/desel-qualification-fixture@1.0.1",
+    "pass": true,
+    "detail": "1.0.1"
+  },
+  {
+    "test": "npm add @magpie-community/desel-qualification-fixture@latest",
+    "pass": true,
+    "detail": "1.0.1"
+  },
+  {
+    "test": "npm add @magpie-community/desel-qualification-fixture@1.0.1",
+    "pass": true,
+    "detail": "1.0.1"
+  },
+  {
+    "test": "one entry after version policy changes",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "test": "npm plugin remove",
+    "pass": true,
+    "detail": ""
+  }
+],"realOAuthLogin":"UNVERIFIED","paidInference":"NOT RUN","realReleaseAutoUpdate":"UNVERIFIED","windowsDPAPI":"UNVERIFIED"}

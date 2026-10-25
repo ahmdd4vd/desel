@@ -1,3 +1,4 @@
+import type {CreatorRequest,CreatorRun} from "./creator-workspace";
 import { Channel } from "@tauri-apps/api/core";
 import type {
   AgentEvent,
@@ -141,11 +142,17 @@ async function browserShim<T>(cmd: string, args: Record<string, unknown> = {}): 
       saveBatch([[LS_REFS,[...refs,...copies]],[LS_COMMENTS,[...comments,...pins]],[LS_DECKS,[deck,...decks]]]);return deck as T;
     }
     case "list_messages": return messages.filter(m => m.deckId === args.deckId) as T;
-    case "clear_messages": saveLS(LS_MESSAGES, messages.filter(m => m.deckId !== args.deckId)); return undefined as T;
+    case "creator_resume_plan": return {runId:String(args.runId),finished:[],uncertain:[],safeBoundary:true} as T;
+    case "get_creator_workspace": return null as T;
+    case "save_creator_workspace": return undefined as T;
+    case "get_chat_branches": return (JSON.parse(localStorage.getItem(`desel.branches.${args.deckId}`)||"null")) as T;
+    case "save_chat_branches": localStorage.setItem(`desel.branches.${args.deckId}`, JSON.stringify(args.branches)); return undefined as T;
+    case "clear_messages": localStorage.removeItem(`desel.branches.${args.deckId}`); saveLS(LS_MESSAGES, messages.filter(m => m.deckId !== args.deckId)); return undefined as T;
     case "append_message": {
       const m: ChatMessage = { id: id("msg"), deckId: String(args.deckId), role: String(args.role) as ChatMessage["role"], content: String(args.content), createdAt: new Date().toISOString() };
       saveLS(LS_MESSAGES, [...messages, m]); return m as T;
     }
+    case "creator_runs":return [] as T;
     case "send_to_agent": throw new Error("Agent chat hanya tersedia di app desktop setelah mengisi provider API.");
     case "submit_render_review": return undefined as T;
     case "report_geometry_lints": return undefined as T; // browser: findings stay in the UI
@@ -319,14 +326,20 @@ export const api = {
   saveRecoveryCopy:(deck:Deck)=>invoke<Deck>("save_recovery_copy",{deck}),
   duplicateDeck: (id: string) => invoke<Deck>("duplicate_deck", { id }),
   listMessages: (deckId: string) => invoke<ChatMessage[]>("list_messages", { deckId }),
+  getCreatorWorkspace: (deckId: string) => invoke<unknown | null>("get_creator_workspace", { deckId }),
+  saveCreatorWorkspace: (deckId: string, workspace: unknown) => invoke<void>("save_creator_workspace", { deckId, workspace }),
+  creatorResumePlan: (runId: string) => invoke<{runId:string;finished:{callId:string;tool:string}[];uncertain:{callId:string;tool:string}[];safeBoundary:boolean}>("creator_resume_plan", { runId }),
+  getChatBranches: (deckId: string) => invoke<unknown | null>("get_chat_branches", { deckId }),
+  saveChatBranches: (deckId: string, branches: unknown) => invoke<void>("save_chat_branches", { deckId, branches }),
   clearMessages: (deckId: string) => invoke<void>("clear_messages", { deckId }),
   appendMessage: (deckId: string, role: ChatMessage["role"], content: string) => invoke<ChatMessage>("append_message", { deckId, role, content }),
-  sendToAgent: (deckId: string, text: string, onEvent: (event: AgentEvent) => void) => {
+  creatorRuns:(deckId:string)=>invoke<CreatorRun[]>("creator_runs",{deckId}),
+  sendToAgent: (deckId: string, text: string, onEvent: (event: AgentEvent) => void, context?:CreatorRequest) => {
     // The Tauri Channel constructor throws outside the desktop runtime, so build
     // it only there; in the browser the invoke shim answers with its own error.
     if (!isTauri) return invoke<void>("send_to_agent", { deckId, text });
     const channel = new Channel<AgentEvent>(onEvent);
-    return invoke<void>("send_to_agent", { deckId, text, channel });
+    return invoke<void>("send_to_agent", { deckId, text, channel, context });
   },
   listTemplates: () => invoke<TemplateRecord[]>("list_templates"),
   submitRenderReview: (deckId:string,requestId:string,receipt:unknown) => invoke<void>("submit_render_review",{deckId,requestId,receipt}),

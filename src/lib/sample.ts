@@ -4,11 +4,12 @@ import type { Deck, Slide } from "./types";
  * A hand-written deck that ships with the app.
  *
  * It exists for two reasons: a first-run studio should not be an empty grey box,
- * and it shows the visual language the generator aims for — one type stack, one
- * accent, real texture, asymmetric margins — without needing an API key.
+ * and it demonstrates typography and manual editing without an API key.
+ * It is not the approved product-carousel benchmark: there are no product
+ * screenshots or illustration-led cover. See scripts/benchmark/README.md.
  *
- * Every slide here is expected to pass the same automated design review the
- * agent's slides go through.
+ * Mechanical geometry can be clear while the product-carousel quality gate
+ * fails. Never present this sample as autonomous premium-output evidence.
  */
 
 const GRAIN = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`;

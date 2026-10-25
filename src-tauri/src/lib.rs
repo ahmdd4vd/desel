@@ -5,6 +5,7 @@
 //! - drive an agent loop against any OpenAI-compatible provider
 //! - expose web research + filesystem export as tools/commands
 
+mod creator;
 mod response_protocol;
 mod project_file;
 mod export_files;
@@ -21,6 +22,7 @@ mod provider_runtime;
 mod palette;
 mod research;
 mod tools;
+mod tokens;
 
 use tauri::Manager;
 
@@ -71,8 +73,14 @@ pub fn run() {
             commands::duplicate_deck,
             commands::list_messages,
             commands::clear_messages,
+            commands::get_chat_branches,
+            commands::creator_resume_plan,
+            commands::get_creator_workspace,
+            commands::save_creator_workspace,
+            commands::save_chat_branches,
             commands::append_message,
             commands::send_to_agent,
+            commands::creator_runs,
             commands::report_geometry_lints,
             commands::submit_render_review,
             commands::cancel_agent,

@@ -1,3 +1,5 @@
+import {selectMemory} from "../lib/creator-workspace";
+import type {CreatorRequest} from "../lib/creator-workspace";
 import {aspectSize as geometryAspect} from "../lib/types";
 import {readLocalDraft,retainLocalDraft,clearLocalDraft,type LocalDraft} from "../lib/local-drafts";
 import {reconcileDeck} from "../lib/reconcile-deck";
@@ -7,6 +9,7 @@ import {geometryRules} from "../lib/geometry";
 import { create } from "zustand";
 import { api, defaultSettings, emptyDeckRecord } from "../lib/api";
 import { sampleDeck } from "../lib/sample";
+import { appendNode, emptyBranches, forkAtUser, seedFromLog, switchTo, type BranchState } from "../lib/chat-branches";
 import type { AgentEvent, AppSettings, Asset, ChatMessage, Comment, Deck, DeckSummary, LintIssue, Slide, SlideRevision, TemplateRecord, ToolCallRecord } from "../lib/types";
 import { followChangedSlideId } from "../lib/live-diff";
 
@@ -26,6 +29,10 @@ interface StudioState {
   decks: DeckSummary[];
   templates: TemplateRecord[];
   messages: ChatMessage[];
+  branches: BranchState;
+  refreshBranches: () => Promise<void>;
+  forkAtMessage: (userMessageId: string) => Promise<boolean>;
+  switchBranch: (userMessageId: string) => Promise<void>;
   comments: Comment[];
   references: Asset[];
   lints: Record<string, LintIssue[]>;
@@ -66,7 +73,7 @@ interface StudioState {
   deleteSlide: (id: string) => void;
   moveSlide: (id: string, delta: -1 | 1) => void;
   reorderSlide: (id: string, to: number) => void;
-  sendMessage: (text: string) => Promise<boolean>;
+  sendMessage: (text: string, context?:CreatorRequest) => Promise<boolean>;
   stopAgent: () => Promise<void>;
   clearChat: () => Promise<void>;
   saveTemplate: (name: string, description: string) => Promise<void>;
@@ -147,6 +154,10 @@ export const useStudio = create<StudioState>((set, get) => ({
   decks: [],
   templates: [],
   messages: [],
+  branches: emptyBranches(),
+  refreshBranches: async () => {const id=get().deck.id;try{const raw=await api.getChatBranches(id) as BranchState|null;if(get().deck.id===id)set({branches:raw&&Array.isArray(raw.nodes)?raw:emptyBranches()});}catch{/* keep linear view */}},
+  forkAtMessage: async (mid) => {if(get().status!=="idle")return false;const id=get().deck.id;let b=get().branches;if(!b.nodes.length)b=seedFromLog(get().messages);if(!b.nodes.some(n=>n.messageId===mid))return false;b=forkAtUser(b,mid);try{await api.saveChatBranches(id,b);}catch(e){get().notify("error",`Cabang gagal disimpan: ${String(e)}`);return false;}if(get().deck.id!==id)return false;set({branches:b});return true;},
+  switchBranch: async (mid) => {if(get().status!=="idle")return;const id=get().deck.id;const b=switchTo(get().branches,mid);if(b===get().branches)return;try{await api.saveChatBranches(id,b);}catch(e){get().notify("error",String(e));return;}if(get().deck.id===id)set({branches:b});},
   comments: [],
   references: [],
   lints: {},
@@ -394,7 +405,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     scheduleSave(deck);
   },
 
-  sendMessage: async (raw) => {
+  sendMessage: async (raw, context) => {
     window.dispatchEvent(new Event('desel-before-context-switch'));
     const text = raw.trim(); if (!text || get().status !== "idle") return false;
     const source=get().deck;
@@ -403,14 +414,15 @@ export const useStudio = create<StudioState>((set, get) => ({
     if(get().deck.id!==source.id){get().notify("info","Proyek berubah saat menyimpan. Pesan belum dikirim; tinjau proyek lalu kirim lagi.");return false;}
     const deckId = source.id;
     const userMsg: ChatMessage = { id: localId("msg"), deckId, role: "user", content: text, createdAt: new Date().toISOString() };
-    set({ status: "generating", statusMessage: "Agent bekerja", messages: [...get().messages, userMsg], streamingReasoning: "", streamingText: "", liveTools: [] });
+    set({ status: "generating", statusMessage: "Agent bekerja", messages: [...get().messages, userMsg], branches: get().branches.nodes.length?appendNode(get().branches,userMsg.id):get().branches, streamingReasoning: "", streamingText: "", liveTools: [] });
     let runError=false;
     let endReason="";
     try {
-      await api.sendToAgent(deckId, text, (event: AgentEvent) => {if(event.type==="error")runError=true;if(event.type==="done")endReason=event.reason;applyAgentEvent(event, set, get)});
+      await api.sendToAgent(deckId, text, (event: AgentEvent) => {if(event.type==="error")runError=true;if(event.type==="done")endReason=event.reason;applyAgentEvent(event, set, get)},context?{...context,memory:selectMemory(context.memory,text),runId:crypto.randomUUID()}:undefined);
       const [messages, deck, comments] = await Promise.all([api.listMessages(deckId), api.getDeck(deckId), api.listComments(deckId)]);
       const merge=deck?reconcileDeck(persisted.get(deck.id),get().deck,deck):null;
       if(deck)rememberPersisted(deck);if(merge?.retained)scheduleSave(merge.deck);
+      await get().refreshBranches();
       set({ messages, ...(merge ? { deck:merge.deck,...(!merge.retained?{saveState:"saved" as const,saveError:""}:{}) } : {}), comments, streamingReasoning: "", streamingText: "", liveTools: [], status: "idle", statusMessage: runError ? "Proses terputus. Hasil tersimpan dimuat; periksa sebelum lanjut." : Object.values(get().reviewHistory).some(r=>r.regressed) ? "Regresi tata letak: hasil terbaru tersimpan; versi tanpa temuan mekanis tersedia untuk ditinjau, bukan otomatis dipulihkan." : endReason === "review_required" ? "Hasil tersimpan, review wajib: temuan tersisa atau render belum terverifikasi." : endReason === "cancelled" ? "Dihentikan. Hasil tersimpan tetap ada; kirim pesan untuk lanjut." : endReason === "max_turns" ? "Batas langkah tercapai. Hasil tersimpan; lanjutkan lewat chat." : "" });
       await get().refreshDecks();
       await get().refreshHistory();
@@ -439,7 +451,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   clearChat: async () => {
     if(get().status!=="idle")return get().notify("info","Hentikan agent sebelum membersihkan chat.");
     const target=get().deck.id;
-    try{await api.clearMessages(target);if(get().deck.id===target)set({ messages: [], streamingReasoning: "", streamingText: "", liveTools: [] });}
+    try{await api.clearMessages(target);if(get().deck.id===target)set({ messages: [], branches: emptyBranches(), streamingReasoning: "", streamingText: "", liveTools: [] });}
     catch(err){get().notify("error",`Chat belum dibersihkan: ${String(err)}`);}
   },
 

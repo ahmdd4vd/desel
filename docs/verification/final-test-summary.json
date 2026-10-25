@@ -1,0 +1,53 @@
+{
+  "ui": [
+    {
+      "from": 0,
+      "count": 12,
+      "passed": true
+    },
+    {
+      "from": 12,
+      "count": 12,
+      "passed": true
+    },
+    {
+      "from": 24,
+      "count": 18,
+      "passed": true
+    },
+    {
+      "from": 42,
+      "count": 18,
+      "passed": true
+    },
+    {
+      "from": 60,
+      "count": 18,
+      "passed": true
+    },
+    {
+      "from": 78,
+      "count": 18,
+      "passed": true
+    },
+    {
+      "from": 96,
+      "count": 18,
+      "passed": true
+    },
+    {
+      "from": 114,
+      "count": 22,
+      "passed": true
+    }
+  ],
+  "rust": {
+    "passed": 172,
+    "ignored": 11
+  },
+  "benchmarkBoundaryAssertions": 11,
+  "typecheck": "pass",
+  "vite": "pass (bundle >500kB warning)",
+  "editorContracts": "pass",
+  "native": "blocked before app code: glib-2.0 unavailable"
+}

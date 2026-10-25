@@ -1,0 +1,97 @@
+{
+  "schema": "desel.design-benchmark.v1",
+  "structuralGate": "failed",
+  "qualityApproval": "unverified",
+  "parity": "unverified",
+  "slides": [
+    {
+      "id": "sample-1",
+      "role": "cover",
+      "textCharacters": 166,
+      "mediaCoverage": 0,
+      "loadedImages": 0,
+      "missingImages": 0,
+      "largeVectors": 0,
+      "geometryFindings": [],
+      "failures": [
+        "No substantial loaded image/vector focal area (text-only/decorative-only risk)."
+      ],
+      "review": [
+        "Reviewer must confirm relevant illustration, not a pasted unrelated image.",
+        "Primary visual source/rights evidence not supplied.",
+        "Focal point, crop, hierarchy, screenshot legibility and reference parity require pixel review."
+      ]
+    },
+    {
+      "id": "sample-2",
+      "role": "body",
+      "textCharacters": 188,
+      "mediaCoverage": 0,
+      "loadedImages": 0,
+      "missingImages": 0,
+      "largeVectors": 0,
+      "geometryFindings": [],
+      "failures": [
+        "No substantial loaded image/vector focal area (text-only/decorative-only risk).",
+        "Body has no loaded raster screenshot."
+      ],
+      "review": [
+        "Reviewer must confirm relevant product-screenshot, not a pasted unrelated image.",
+        "Primary visual source/rights evidence not supplied.",
+        "Focal point, crop, hierarchy, screenshot legibility and reference parity require pixel review."
+      ]
+    },
+    {
+      "id": "sample-3",
+      "role": "body",
+      "textCharacters": 330,
+      "mediaCoverage": 0,
+      "loadedImages": 0,
+      "missingImages": 0,
+      "largeVectors": 0,
+      "geometryFindings": [],
+      "failures": [
+        "No substantial loaded image/vector focal area (text-only/decorative-only risk).",
+        "Body has no loaded raster screenshot."
+      ],
+      "review": [
+        "Reviewer must confirm relevant product-screenshot, not a pasted unrelated image.",
+        "Primary visual source/rights evidence not supplied.",
+        "Focal point, crop, hierarchy, screenshot legibility and reference parity require pixel review."
+      ]
+    },
+    {
+      "id": "sample-4",
+      "role": "closer",
+      "textCharacters": 74,
+      "mediaCoverage": 0,
+      "loadedImages": 0,
+      "missingImages": 0,
+      "largeVectors": 0,
+      "geometryFindings": [],
+      "failures": [],
+      "review": [
+        "Closer must suit narrative; CTA is not mandatory.",
+        "Focal point, crop, hierarchy, screenshot legibility and reference parity require pixel review."
+      ]
+    }
+  ],
+  "failures": [
+    "sample-1: No substantial loaded image/vector focal area (text-only/decorative-only risk).",
+    "sample-2: No substantial loaded image/vector focal area (text-only/decorative-only risk).",
+    "sample-2: Body has no loaded raster screenshot.",
+    "sample-3: No substantial loaded image/vector focal area (text-only/decorative-only risk).",
+    "sample-3: Body has no loaded raster screenshot."
+  ],
+  "review": [
+    "Original reference images/approved benchmark absent; image-to-image parity unavailable.",
+    "Research claims have not been checked against primary sources.",
+    "Asset rights have not been checked.",
+    "Structural clearance is NOT premium-design, factual, rights or autonomous-generation approval."
+  ],
+  "policy": {
+    "minimumMediaFraction": 0.12,
+    "ruleSource": "User-recorded cover illustration / real product screenshots + roomy text / suitable closer; text-only slides rejected.",
+    "thresholdStatus": "12% media-box union is a local triage heuristic, NOT a user-approved pixel ratio or aesthetic score."
+  }
+}

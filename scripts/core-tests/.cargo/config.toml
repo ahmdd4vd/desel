@@ -1,0 +1,3 @@
+[build]
+rustflags=["--cfg","desel_harness"]
+rustdocflags=["--cfg","desel_harness"]

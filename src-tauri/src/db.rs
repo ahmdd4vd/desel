@@ -110,6 +110,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS creator_runs(id TEXT PRIMARY KEY,deck_id TEXT NOT NULL,doc TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS creator_steps(run_id TEXT NOT NULL,call_id TEXT NOT NULL,doc TEXT NOT NULL,PRIMARY KEY(run_id,call_id));
             CREATE TABLE IF NOT EXISTS brand_profiles(id TEXT PRIMARY KEY,doc TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS deck_history (seq INTEGER PRIMARY KEY AUTOINCREMENT,deck_id TEXT NOT NULL,direction TEXT NOT NULL,doc TEXT NOT NULL,comments TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_deck_history ON deck_history(deck_id,direction,seq DESC);
@@ -188,6 +190,8 @@ impl Db {
         for column in ["reference_role", "reference_status", "provenance"] {let _=conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),[]);}
         // Older databases predate the profile column.
         let _=conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT NOT NULL DEFAULT ''",[]);
+        conn.execute("CREATE TABLE IF NOT EXISTS creator_workspace(deck_id TEXT PRIMARY KEY, doc TEXT NOT NULL, updated_at TEXT NOT NULL)",[])?;
+        conn.execute("CREATE TABLE IF NOT EXISTS chat_branches(deck_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL)",[])?;
         let _ = conn.execute(
             "ALTER TABLE assets ADD COLUMN meta TEXT NOT NULL DEFAULT ''",
             [],
@@ -378,9 +382,13 @@ impl Db {
 
     pub fn delete_deck(&self, id: &str) -> rusqlite::Result<()> {
         let mut guard=self.conn.lock().unwrap();let conn=guard.transaction()?;
+        conn.execute("DELETE FROM creator_steps WHERE run_id IN (SELECT id FROM creator_runs WHERE deck_id=?1)",params![id])?;
+        conn.execute("DELETE FROM creator_runs WHERE deck_id=?1",params![id])?;
         conn.execute("DELETE FROM deck_history WHERE deck_id=?1",params![id])?;
         conn.execute("DELETE FROM decks WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM response_outputs WHERE deck_id = ?1", params![id])?;
+        conn.execute("DELETE FROM chat_branches WHERE deck_id = ?1", params![id])?;
+        conn.execute("DELETE FROM creator_workspace WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM messages WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM comments WHERE deck_id = ?1", params![id])?;
         conn.execute("DELETE FROM assets WHERE deck_id = ?1", params![id])?;
@@ -525,9 +533,88 @@ impl Db {
         Ok(())
     }
 
+    /// Branch lineage is metadata beside the linear log. Only ids that exist as messages of this deck are accepted.
+    pub fn save_chat_branches(&self, deck_id: &str, state: &serde_json::Value) -> Result<(), String> {
+        let nodes = state.get("nodes").and_then(|n| n.as_array()).ok_or("branch state needs nodes")?;
+        let json = serde_json::to_string(state).map_err(|e| e.to_string())?;
+        if json.len() > 1024 * 1024 || nodes.len() > 20000 { return Err("Oversized branch state".into()); }
+        let conn = self.conn.lock().unwrap();
+        let known: std::collections::HashSet<String> = {
+            let mut st = conn.prepare("SELECT id FROM messages WHERE deck_id=?1").map_err(|e| e.to_string())?;
+            let rows = st.query_map(params![deck_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        let ids = nodes.iter().filter_map(|n| n.get("messageId").and_then(|v| v.as_str()));
+        for id in ids { if !known.contains(id) { return Err(format!("Unknown message in branch state: {id}")); } }
+        if let Some(leaf) = state.get("activeLeaf").and_then(|v| v.as_str()) { if !known.contains(leaf) { return Err("Unknown active leaf".into()); } }
+        conn.execute("INSERT OR REPLACE INTO chat_branches(deck_id,state,updated_at) VALUES(?1,?2,?3)", params![deck_id, json, now()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Durable mirror of the per-project Creator workspace (draft, queue, memory). Shape-checked, never executed.
+    pub fn check_creator_workspace(doc: &serde_json::Value) -> Result<(), String> {
+        let ok = doc.get("draft").map_or(false, |v| v.is_string()) && doc.get("queue").map_or(false, |v| v.is_array()) && doc.get("memory").map_or(false, |v| v.is_array()) && doc.get("lockedSlideIds").map_or(false, |v| v.is_array()) && doc.get("lockedObjects").map_or(true, |v| v.is_array());
+        if !ok { return Err("Invalid Creator workspace shape".into()); }
+        let json = serde_json::to_string(doc).map_err(|e| e.to_string())?;
+        if json.len() > 512 * 1024 { return Err("Creator workspace exceeds 512 KB".into()); }
+        Ok(())
+    }
+
+    pub fn save_creator_workspace(&self, deck_id: &str, doc: &serde_json::Value) -> Result<(), String> {
+        Self::check_creator_workspace(doc)?;
+        let json = serde_json::to_string(doc).map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row("SELECT 1 FROM decks WHERE id=?1", params![deck_id], |_| Ok(true)).unwrap_or(false);
+        if !exists { return Err("Unknown project".into()); }
+        conn.execute("INSERT OR REPLACE INTO creator_workspace(deck_id,doc,updated_at) VALUES(?1,?2,?3)", params![deck_id, json, now()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn creator_workspace(&self, deck_id: &str) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().unwrap();
+        let raw: String = conn.query_row("SELECT doc FROM creator_workspace WHERE deck_id=?1", params![deck_id], |r| r.get(0)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn chat_branches(&self, deck_id: &str) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().unwrap();
+        let raw: String = conn.query_row("SELECT state FROM chat_branches WHERE deck_id=?1", params![deck_id], |r| r.get(0)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Messages the model may see. With no branch state this is the full log. Tracked messages
+    /// follow the active path; untracked ones (agent replies, tool rows) inherit from the message before them.
+    pub fn active_history(&self, deck_id: &str) -> Vec<ChatMessage> {
+        let all = self.list_messages(deck_id);
+        let Some(state) = self.chat_branches(deck_id) else { return all };
+        let nodes: Vec<(String, Option<String>)> = state.get("nodes").and_then(|n| n.as_array()).map(|a| a.iter().filter_map(|n| Some((n.get("messageId")?.as_str()?.to_string(), n.get("parentId").and_then(|v| v.as_str()).map(String::from)))).collect()).unwrap_or_default();
+        if nodes.is_empty() { return all; }
+        let parent: std::collections::HashMap<&str, Option<&str>> = nodes.iter().map(|(m, p)| (m.as_str(), p.as_deref())).collect();
+        let mut path = std::collections::HashSet::new();
+        let mut cur = state.get("activeLeaf").and_then(|v| v.as_str());
+        while let Some(id) = cur { if !path.insert(id.to_string()) { break; } cur = parent.get(id).copied().flatten(); }
+        let mut keep = true;
+        all.into_iter().filter(|m| { if parent.contains_key(m.id.as_str()) { keep = path.contains(&m.id); } keep }).collect()
+    }
+
+    /// Register a new user turn under the active leaf (only when branching is in use).
+    pub fn track_user_turn(&self, deck_id: &str, message_id: &str) -> Result<(), String> {
+        let Some(mut state) = self.chat_branches(deck_id) else { return Ok(()) };
+        let leaf = state.get("activeLeaf").cloned().unwrap_or(serde_json::Value::Null);
+        let nodes = state.get_mut("nodes").and_then(|n| n.as_array_mut()).ok_or("bad branch state")?;
+        if nodes.iter().any(|n| n.get("messageId").and_then(|v| v.as_str()) == Some(message_id)) { return Ok(()); }
+        let branch = if leaf.is_null() { "main".to_string() } else if nodes.iter().any(|n| n.get("parentId") == Some(&leaf)) { format!("b-{message_id}") } else { nodes.iter().find(|n| n.get("messageId") == Some(&leaf)).and_then(|n| n.get("branchId")).and_then(|v| v.as_str()).unwrap_or("main").to_string() };
+        nodes.push(serde_json::json!({"messageId":message_id,"parentId":leaf,"branchId":branch}));
+        state["activeLeaf"] = serde_json::json!(message_id);
+        self.save_chat_branches(deck_id, &state)
+    }
+
     pub fn clear_messages(&self, deck_id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM chat_branches WHERE deck_id = ?1", params![deck_id])?;
         conn.execute("DELETE FROM response_outputs WHERE deck_id = ?1", params![deck_id])?;
+        conn.execute("DELETE FROM creator_steps WHERE run_id IN (SELECT id FROM creator_runs WHERE deck_id=?1)",params![deck_id])?;
+        conn.execute("DELETE FROM creator_runs WHERE deck_id=?1",params![deck_id])?;
         conn.execute("DELETE FROM messages WHERE deck_id = ?1", params![deck_id])?;
         Ok(())
     }
@@ -1094,4 +1181,135 @@ impl Db{
  }
  drop(db);let _=std::fs::remove_file(p);
 }
+}
+
+// Durable runs are a journal, never a replay queue. A running entry after a
+// restart means interrupted/unknown, not permission to execute tools again.
+impl Db{
+ pub fn begin_creator_run(&self,id:&str,deck_id:&str,request:&serde_json::Value,msg:&ChatMessage)->Result<(),String>{
+  let mut c=self.conn.lock().map_err(|_|"Run database unavailable")?;
+  c.execute_batch("CREATE TABLE IF NOT EXISTS creator_runs(id TEXT PRIMARY KEY,deck_id TEXT NOT NULL,doc TEXT NOT NULL); CREATE TABLE IF NOT EXISTS creator_steps(run_id TEXT NOT NULL,call_id TEXT NOT NULL,doc TEXT NOT NULL,PRIMARY KEY(run_id,call_id));").map_err(|e|e.to_string())?;
+  let tx=c.transaction().map_err(|e|e.to_string())?;
+  let doc=serde_json::json!({"id":id,"deckId":deck_id,"request":request,"state":"running","updatedAt":now(),"lastEvent":"started"});
+  tx.execute("INSERT INTO creator_runs(id,deck_id,doc)VALUES(?1,?2,?3)",params![id,deck_id,doc.to_string()]).map_err(|_|"Run ID already exists; nothing was replayed")?;
+  tx.execute("INSERT INTO messages(id,deck_id,role,content,tool_calls,tool_call_id,created_at)VALUES(?1,?2,?3,?4,'[]',NULL,?5)",params![msg.id,msg.deck_id,msg.role,msg.content,msg.created_at]).map_err(|e|e.to_string())?;
+  tx.commit().map_err(|e|e.to_string())
+ }
+ pub fn creator_runs(&self,deck_id:&str)->Result<Vec<serde_json::Value>,String>{
+  let c=self.conn.lock().map_err(|_|"Run database unavailable")?;c.execute_batch("CREATE TABLE IF NOT EXISTS creator_runs(id TEXT PRIMARY KEY,deck_id TEXT NOT NULL,doc TEXT NOT NULL);").map_err(|e|e.to_string())?;
+  let mut q=c.prepare("SELECT doc FROM creator_runs WHERE deck_id=?1 ORDER BY rowid DESC LIMIT 20").map_err(|e|e.to_string())?;
+  let rows=q.query_map(params![deck_id],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+  rows.map(|r|serde_json::from_str(&r.map_err(|e|e.to_string())?).map_err(|e|e.to_string())).collect()
+ }
+ pub fn checkpoint_creator_run(&self,id:&str,state:&str,event:&str)->Result<(),String>{
+  let c=self.conn.lock().map_err(|_|"Run database unavailable")?;
+  let raw:String=c.query_row("SELECT doc FROM creator_runs WHERE id=?1",params![id],|r|r.get(0)).map_err(|e|e.to_string())?;
+  let mut doc:serde_json::Value=serde_json::from_str(&raw).map_err(|e|e.to_string())?;doc["state"]=serde_json::json!(state);doc["lastEvent"]=serde_json::json!(event);doc["updatedAt"]=serde_json::json!(now());
+  c.execute("UPDATE creator_runs SET doc=?2 WHERE id=?1",params![id,doc.to_string()]).map_err(|e|e.to_string())?;Ok(())
+ }
+ /// Journal-derived resume plan: what finished (never repeat), what has an unknown outcome (inspect first).
+ /// `safe_boundary` is true only when no step is left in an uncertain state.
+ pub fn creator_resume_plan(&self,run:&str)->Result<serde_json::Value,String>{
+  let c=self.conn.lock().map_err(|_|"Run database unavailable")?;
+  let exists:bool=c.query_row("SELECT 1 FROM creator_runs WHERE id=?1",params![run],|_|Ok(true)).unwrap_or(false);
+  if !exists{return Err("Unknown run".into())}
+  let mut q=c.prepare("SELECT call_id,doc FROM creator_steps WHERE run_id=?1 ORDER BY rowid").map_err(|e|e.to_string())?;
+  let rows=q.query_map(params![run],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
+  let(mut finished,mut uncertain)=(Vec::new(),Vec::new());
+  for row in rows{let(call,raw)=row.map_err(|e|e.to_string())?;let d:serde_json::Value=serde_json::from_str(&raw).unwrap_or_default();let name=d["name"].as_str().unwrap_or("unknown").to_string();let item=serde_json::json!({"callId":call,"tool":name});if d["state"]=="finished"{finished.push(item)}else{uncertain.push(item)}}
+  Ok(serde_json::json!({"runId":run,"finished":finished,"uncertain":uncertain,"safeBoundary":uncertain.is_empty()}))
+ }
+ pub fn creator_step(&self,run:&str,call:&str,name:&str,state:&str)->Result<(),String>{
+  let c=self.conn.lock().map_err(|_|"Run database unavailable")?;
+  let doc=serde_json::json!({"name":name,"state":state,"updatedAt":now()});
+  if state=="started"{c.execute("INSERT INTO creator_steps(run_id,call_id,doc)VALUES(?1,?2,?3)",params![run,call,doc.to_string()]).map_err(|_|"Tool ID already journaled; execution blocked, not replayed")?;}else{c.execute("UPDATE creator_steps SET doc=?3 WHERE run_id=?1 AND call_id=?2",params![run,call,doc.to_string()]).map_err(|e|e.to_string())?;}Ok(())
+ }
+}
+#[cfg(test)]mod creator_journal_tests{use super::*;use serde_json::json;
+ #[test]fn restart_keeps_receipts_and_duplicate_never_replays(){let p=std::env::temp_dir().join(new_id("journal"));let db=Db::open(p.clone()).unwrap();let m:ChatMessage=serde_json::from_value(json!({"id":"m","deckId":"d","role":"user","content":"brief","createdAt":"now"})).unwrap();db.begin_creator_run("r","d",&json!({"text":"brief"}),&m).unwrap();assert!(db.begin_creator_run("r","d",&json!({}),&m).is_err());assert_eq!(db.list_messages("d").len(),1);db.creator_step("r","call","write_slide","started").unwrap();assert!(db.creator_step("r","call","write_slide","started").is_err());drop(db);let db=Db::open(p.clone()).unwrap();assert_eq!(db.creator_runs("d").unwrap()[0]["state"],"running");assert!(db.creator_runs("other").unwrap().is_empty());db.creator_step("r","call","write_slide","finished").unwrap();db.checkpoint_creator_run("r","settled","Review results").unwrap();assert_eq!(db.creator_runs("d").unwrap()[0]["state"],"settled");drop(db);let _=std::fs::remove_file(p);}
+}
+
+#[cfg(test)]
+mod resume_plan_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn resume_plan_separates_finished_from_uncertain_and_survives_restart() {
+        let p = std::env::temp_dir().join(new_id("resume"));
+        let db = Db::open(p.clone()).unwrap();
+        let m: ChatMessage = serde_json::from_value(json!({"id":"m","deckId":"d","role":"user","content":"b","createdAt":"now"})).unwrap();
+        db.begin_creator_run("r", "d", &json!({"text":"b"}), &m).unwrap();
+        db.creator_step("r", "c1", "write_slide", "started").unwrap();
+        db.creator_step("r", "c1", "write_slide", "finished").unwrap();
+        db.creator_step("r", "c2", "add_asset", "started").unwrap();
+        drop(db);
+        let db = Db::open(p.clone()).unwrap();
+        let plan = db.creator_resume_plan("r").unwrap();
+        assert_eq!(plan["finished"][0]["callId"], "c1");
+        assert_eq!(plan["uncertain"][0]["tool"], "add_asset");
+        assert_eq!(plan["safeBoundary"], false);
+        db.creator_step("r", "c2", "add_asset", "finished").unwrap();
+        assert_eq!(db.creator_resume_plan("r").unwrap()["safeBoundary"], true);
+        assert!(db.creator_resume_plan("ghost").is_err());
+        drop(db);
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn branch_state_persists_validates_and_is_cleared() {
+        let p = std::env::temp_dir().join(new_id("branches"));
+        let db = Db::open(p.clone()).unwrap();
+        for id in ["u1", "a1", "u2"] {
+            let m: ChatMessage = serde_json::from_value(json!({"id":id,"deckId":"d","role":"user","content":"x","createdAt":"now"})).unwrap();
+            db.append_message(&m).unwrap();
+        }
+        let ok = json!({"nodes":[{"messageId":"u1","parentId":null,"branchId":"main"},{"messageId":"u2","parentId":"u1","branchId":"b"}],"activeLeaf":"u2"});
+        db.save_chat_branches("d", &ok).unwrap();
+        assert!(db.save_chat_branches("d", &json!({"nodes":[{"messageId":"ghost"}],"activeLeaf":null})).is_err());
+        assert!(db.save_chat_branches("other", &ok).is_err());
+        assert!(db.save_chat_branches("d", &json!({"nodes":[],"activeLeaf":"ghost"})).is_err());
+        drop(db);
+        let db = Db::open(p.clone()).unwrap();
+        assert_eq!(db.chat_branches("d").unwrap()["activeLeaf"], "u2");
+        assert!(db.chat_branches("other").is_none());
+        // fork: u1 -> u2 (a2 reply untracked), then fork from u1 and send u3
+        let a2: ChatMessage = serde_json::from_value(json!({"id":"a2","deckId":"d","role":"assistant","content":"r","createdAt":"now"})).unwrap();
+        db.append_message(&a2).unwrap();
+        assert_eq!(db.active_history("d").len(), 4);
+        db.save_chat_branches("d", &json!({"nodes":[{"messageId":"u1","parentId":null,"branchId":"main"},{"messageId":"u2","parentId":"u1","branchId":"main"}],"activeLeaf":"u1"})).unwrap();
+        let u3: ChatMessage = serde_json::from_value(json!({"id":"u3","deckId":"d","role":"user","content":"x","createdAt":"now"})).unwrap();
+        db.append_message(&u3).unwrap();
+        db.track_user_turn("d", "u3").unwrap();
+        let ids: Vec<String> = db.active_history("d").into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["u1","a1","u3"]);
+        assert_eq!(db.chat_branches("d").unwrap()["activeLeaf"], "u3");
+        db.clear_messages("d").unwrap();
+        assert!(db.chat_branches("d").is_none());
+        drop(db);
+        let _ = std::fs::remove_file(p);
+    }
+    #[test]
+    fn creator_workspace_mirror_persists_validates_and_follows_project_delete() {
+        let p = std::env::temp_dir().join(new_id("ws"));
+        let db = Db::open(p.clone()).unwrap();
+        let d: Deck = serde_json::from_value(serde_json::json!({"id":"d","slides":[]})).unwrap();
+        db.save_deck(&d, None).unwrap();
+        let ws = serde_json::json!({"draft":"x","queue":[],"memory":[{"id":"m","text":"t","source":"s","pinned":true,"kind":"fact"}],"mode":"edit","lockedSlideIds":["a"]});
+        db.save_creator_workspace("d", &ws).unwrap();
+        assert!(db.save_creator_workspace("d", &serde_json::json!({"draft":1})).is_err());
+        assert!(db.save_creator_workspace("ghost", &ws).is_err());
+        drop(db);
+        let db = Db::open(p.clone()).unwrap();
+        assert_eq!(db.creator_workspace("d").unwrap()["memory"][0]["id"], "m");
+        assert!(db.creator_workspace("other").is_none());
+        db.delete_deck("d").unwrap();
+        assert!(db.creator_workspace("d").is_none());
+        drop(db);
+        let _ = std::fs::remove_file(p);
+    }
 }
