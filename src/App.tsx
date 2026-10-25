@@ -64,6 +64,7 @@ import {
   Trash2,
   Wand2,
   X,
+  StickyNote, ClipboardCheck,
 } from "lucide-react";
 import { api } from "./lib/api";
 import {
@@ -479,6 +480,8 @@ export default function App() {
   const [presenting,setPresenting]=useState(false);
   const [organizerOpen,setOrganizerOpen]=useState(false);
   const [slideSearchOpen,setSlideSearchOpen]=useState(false);
+  const [toolsOpen,setToolsOpen]=useState(()=>{try{return localStorage.getItem('desel-tools-open')==='1'}catch{return false}});
+  const toggleTools=()=>setToolsOpen(v=>{const n=!v;try{localStorage.setItem('desel-tools-open',n?'1':'0')}catch{}return n});
   const [projectReviewOpen,setProjectReviewOpen]=useState(false);
   const [aspectChange,setAspectChange]=useState<{deckId:string;from:Deck["aspect"];to:Deck["aspect"]}|null>(null);
   const busy = status === "generating";
@@ -781,6 +784,7 @@ export default function App() {
 
         <input
           className="title-input"
+          aria-label="Judul carousel"
           value={deck.title}
           onChange={(e) => updateDeck({ title: e.target.value })}
           placeholder="Judul carousel"
@@ -804,6 +808,7 @@ export default function App() {
             </button>
           )}
           <div className="menu-section-label">Proyek</div>
+          <label className="menu-title-field">Judul carousel<input aria-label="Ubah judul carousel" value={deck.title} onChange={e=>updateDeck({title:e.target.value})} placeholder="Judul carousel" spellCheck={false}/></label>
           {draftWarning&&<div className="save-health error">Draft cadangan lokal tidak tersedia (batas ruang/perangkat). Simpan atau backup sebelum menutup.</div>}
           <div className={`save-health ${saveState}`} role="status" title={saveError}>{saveState==="saved"?"Semua perubahan tersimpan lokal":saveState==="saving"?"Menyimpan perubahan…":saveState==="dirty"?"Perubahan belum tersimpan":"Belum tersimpan. Coba Simpan atau buat salinan pemulihan lokal."}</div>
           <button className="menu-row" disabled={busy||projectBusy||!historyCounts[0]} onClick={()=>void stepHistory("undo")}><span>Batalkan perubahan proyek</span><kbd>Ctrl+Z</kbd></button>
@@ -835,12 +840,12 @@ export default function App() {
 
           {left === "chat" && (
             <div className="chat">
-              <div className="chat-toolbar"><Search size={13}/><input aria-label="Cari percakapan" placeholder="Cari percakapan…" value={chatQuery} onChange={e=>setChatQuery(e.target.value)}/><span>CREATOR STUDIO</span></div>
+              <div className="chat-toolbar"><Search size={13}/><input aria-label="Cari percakapan" placeholder="Cari percakapan…" value={chatQuery} onChange={e=>setChatQuery(e.target.value)}/></div>
               <div className="chat-log" ref={logRef} onScroll={e => {const el=e.currentTarget;followingChat.current=el.scrollHeight-el.clientHeight-el.scrollTop<90;setJumpVisible(!followingChat.current);}}>
                 {messages.length === 0 && !deck.slides.length && (
                   <div className="chat-hello">
                     <h2>
-                      Mau bikin apa <em>hari ini?</em>
+                      Mau bikin apa hari ini?
                     </h2>
                     <p>
                       Kasih topik, audiens, atau referensi visual. Agent menanyakan yang belum jelas,
@@ -977,7 +982,6 @@ export default function App() {
 
               {!busy&&deck.slides.map(slide=>{const h=reviewHistory[slide.id];return h?.regressed?<div className="completion-review" key={`regression-${slide.id}`} role="status"><span>Regresi pada {slide.title}: {h.latest.findings} temuan. Versi {h.lastClear?.revision} tanpa temuan mekanis tersimpan, belum disetujui visual/isi.</span><button className="link" onClick={()=>{selectSlide(slide.id);setRight("design");setInspector(true);void refreshRevisions(slide.id);}}>Tinjau versi dan pemulihan</button></div>:null;})}
               {!busy&&statusMessage&&!Object.values(reviewHistory).some(h=>h.regressed)&&<div className="completion-review" role="status"><span>{statusMessage}</span>{deck.slides.some(s=>(lints[s.id]??[]).some(i=>["overlap","text-image-overlap","text-overflow"].includes(i.rule)))&&<button className="link" onClick={()=>{setDraft("Perbaiki temuan geometri pada deck ini saja. Baca slide terkait, pertahankan konten dan slide lain. Jangan klaim selesai sebelum temuan terselesaikan.");composerRef.current?.focus();}}>Siapkan revisi tata letak</button>}</div>}
-              <div className="library-entry"><button className="btn btn-sm" onClick={()=>setLibraryOpen(true)}>Pustaka aset proyek</button><button className="btn btn-sm" onClick={()=>setBrandOpen(true)}>Profil brand</button></div>
               <div className={`refs ${refsExpanded || references.length ? "refs-expanded" : "refs-collapsed"}`}>
                 <div className="refs-head">
                   <button className="refs-toggle" onClick={() => setRefsExpanded(v => !v)}><Paperclip size={15} strokeWidth={1.6}/> Referensi & aset <ChevronDown size={12}/></button>
@@ -1085,21 +1089,16 @@ export default function App() {
               </div>
 
               {jumpVisible&&<button className="chat-jump" onClick={()=>{followingChat.current=true;setJumpVisible(false);if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;}}>Ke pesan terbaru ↓</button>}
+              {toolsOpen&&<div className="composer-tools" id="composer-tools">
+              <div className="library-entry" role="group" aria-label="Aset dan brand"><button className="btn btn-sm" onClick={()=>setLibraryOpen(true)}>Pustaka aset proyek</button><button className="btn btn-sm" onClick={()=>setBrandOpen(true)}>Profil brand</button></div>
               <div className="creator-workbench">
                 <CreatorMemory key={deck.id} memory={creator.memory} update={updateCreator}/>
                 <CreatorRuns deckId={deck.id} busy={busy} onContinue={setDraft}/>
                 <ProductionReview key={'production-'+deck.id} workspace={creator} onBrief={text=>{updateCreator(c=>({...c,mode:'discuss',draft:text}));}} onBundle={downloadBrief}/>
               </div>
+              </div>}
               <div className="composer">
                 {creatorStorageError&&<p role="alert">{creatorStorageError}</p>}
-                <div className="creator-scope">
-                  <select aria-label="Mode agent" value={creator.mode} onChange={e=>updateCreator(c=>({...c,mode:e.target.value as ChatScope['mode']}))}><option value="discuss">Diskusi · tanpa edit</option><option value="edit">Edit · slide terpilih</option><option value="produce">Produksi · seluruh deck</option></select>
-                  <label><input type="checkbox" checked={scopeSelected} disabled={!selectedSlideId} onChange={e=>setScopeSelected(e.target.checked)}/> Slide terpilih</label>
-                  {objectContext&&<label title="Konteks objek adalah referensi, bukan kunci region. Mode Edit tetap dibatasi slide."><input type="checkbox" checked={includeObject} onChange={e=>{setIncludeObject(e.target.checked);if(e.target.checked)setScopeSelected(true);}}/> @obj {objectContext.label}</label>}
-                  {scopeSelected&&selectedSlideId&&<span className="scope-chip">@slide {deck.slides.findIndex(s=>s.id===selectedSlideId)+1}</span>}
-                  <select aria-label="Konteks aset" value={scopeAsset} onChange={e=>setScopeAsset(e.target.value)}><option value="">+ Aset konteks</option>{references.map(a=><option key={a.id} value={a.id}>@asset {a.name}</option>)}</select>
-                  {selectedSlideId&&<button title="Kunci slide dari edit agent" className={creator.lockedSlideIds.includes(selectedSlideId)?'active':''} onClick={()=>updateCreator(c=>({...c,lockedSlideIds:c.lockedSlideIds.includes(selectedSlideId!)?c.lockedSlideIds.filter(id=>id!==selectedSlideId):[...c.lockedSlideIds,selectedSlideId!]}))}>{creator.lockedSlideIds.includes(selectedSlideId)?'Terkunci':'Kunci slide'}</button>}
-                </div>
                 {creator.queue.length>0&&<details className="brief-queue" open><summary>Antrean brief · {creator.queue.length} · jalankan setelah review</summary>{creator.queue.map(q=><div key={q.id}><span>{q.text}</span><button disabled={busy} onClick={()=>void runQueued(q.id)}>Jalankan</button><button onClick={()=>updateCreator(c=>({...c,queue:c.queue.filter(item=>item.id!==q.id)}))}>Hapus</button></div>)}</details>}
                 <div className="composer-box">
                   <textarea
@@ -1121,6 +1120,19 @@ export default function App() {
                     }}
                   />
                   <div className="composer-foot">
+                    <button type="button" className="tools-toggle" aria-label="Alat proyek" aria-expanded={toolsOpen} aria-controls="composer-tools" title="Aset, brand, memori, production desk" onClick={toggleTools}><Plus size={16}/></button>
+                <details className="creator-scope" onKeyDown={e=>{if(e.key==='Escape'){e.currentTarget.open=false;e.currentTarget.querySelector('summary')?.focus();e.stopPropagation();}}}>
+                  <summary className="scope-summary" aria-label="Atur scope agent">{creator.mode==='discuss'?'Diskusi':creator.mode==='edit'?'Edit':'Produksi'} · {scopeSelected&&selectedSlideId?`Slide ${deck.slides.findIndex(s=>s.id===selectedSlideId)+1}`:'Deck'}<ChevronDown size={12}/></summary>
+                  <div className="scope-options">
+                  <select aria-label="Mode agent" value={creator.mode} onChange={e=>updateCreator(c=>({...c,mode:e.target.value as ChatScope['mode']}))}><option value="discuss">Diskusi · tanpa edit</option><option value="edit">Edit · slide terpilih</option><option value="produce">Produksi · seluruh deck</option></select>
+                  <label><input type="checkbox" checked={scopeSelected} disabled={!selectedSlideId} onChange={e=>setScopeSelected(e.target.checked)}/> Slide terpilih</label>
+                  {objectContext&&<label title="Konteks objek adalah referensi, bukan kunci region. Mode Edit tetap dibatasi slide."><input type="checkbox" checked={includeObject} onChange={e=>{setIncludeObject(e.target.checked);if(e.target.checked)setScopeSelected(true);}}/> @obj {objectContext.label}</label>}
+                  {scopeSelected&&selectedSlideId&&<span className="scope-chip">@slide {deck.slides.findIndex(s=>s.id===selectedSlideId)+1}</span>}
+                  <select aria-label="Konteks aset" value={scopeAsset} onChange={e=>setScopeAsset(e.target.value)}><option value="">+ Aset konteks</option>{references.map(a=><option key={a.id} value={a.id}>@asset {a.name}</option>)}</select>
+                  {selectedSlideId&&<button title="Kunci slide dari edit agent" className={creator.lockedSlideIds.includes(selectedSlideId)?'active':''} onClick={()=>updateCreator(c=>({...c,lockedSlideIds:c.lockedSlideIds.includes(selectedSlideId!)?c.lockedSlideIds.filter(id=>id!==selectedSlideId):[...c.lockedSlideIds,selectedSlideId!]}))}>{creator.lockedSlideIds.includes(selectedSlideId)?'Terkunci':'Kunci slide'}</button>}
+                  </div>
+                </details>
+                    <span className="foot-spacer"/>
                     {busy && <button className="queue-send" disabled={!draft.trim()} onClick={()=>void send()}>Antrekan</button>}
                     {busy ? (
                       <button className="send stop" onClick={() => void stopAgent()} title="Hentikan agent">
@@ -1310,17 +1322,19 @@ export default function App() {
           </div>
 
           <div className="stage-area">
+            <div className="canvas-actions">
             <button className="canvas-present" disabled={!deck.slides.some(s=>!s.hidden)} onClick={()=>{window.dispatchEvent(new Event("desel-before-context-switch"));setPresenting(true)}}><Maximize2 size={14}/> Presentasi</button>
             <button className="canvas-export" disabled={!deck.slides.length} onClick={() => setExportOpen(true)}><Download size={14}/> Ekspor</button>
+            </div>
             <nav className="canvas-palette" aria-label="Alat canvas">
               <button title="Pilih dan edit elemen" aria-label="Pilih elemen" className={!pinning && view === "focus" ? "on" : ""} onClick={() => {setPinning(false);setView("focus");}}><MousePointer2 size={17}/></button>
-              <button title="Review catatan seluruh proyek" aria-label="Review seluruh proyek" onClick={()=>setProjectReviewOpen(true)}><MessageSquare size={17}/></button>
+              <button title="Review catatan seluruh proyek" aria-label="Review seluruh proyek" onClick={()=>setProjectReviewOpen(true)}><ClipboardCheck size={17}/></button>
               <button title="Cari teks dalam proyek" aria-label="Cari teks slide" onClick={()=>{window.dispatchEvent(new Event("desel-before-context-switch"));setSlideSearchOpen(true)}}><Search size={17}/></button>
               <button title="Kelola urutan dan visibilitas slide" aria-label="Kelola slide" onClick={()=>{window.dispatchEvent(new Event("desel-before-context-switch"));setOrganizerOpen(true)}}><Layers size={17}/></button>
               <button disabled={!deck.slides.length} title="Lihat semua slide" aria-label="Lihat semua slide" className={view === "board" ? "on" : ""} onClick={() => setView("board")}><LayoutGrid size={17}/></button>
               <button disabled={!selected} title="Edit teks: klik dua kali teks pada slide" aria-label="Mode edit teks" onClick={() => {setView("focus");setPinning(false);notify("info","Klik dua kali teks pada slide untuk mengedit.");}}><Type size={17}/></button>
-              <button title="Properti dan riwayat slide" aria-label="Properti dan riwayat slide" onClick={() => {setRight("design");setInspector(v => !v);}}><Layers size={17}/></button>
-              <button disabled={!selected} title="Tambah catatan pada slide" aria-label="Tambah catatan" className={pinning ? "on" : ""} onClick={() => {setView("focus");setPinning(v => !v);}}><MessageSquare size={17}/></button>
+              <button title="Properti dan riwayat slide" aria-label="Properti dan riwayat slide" onClick={() => {setRight("design");setInspector(v => !v);}}><PanelRight size={17}/></button>
+              <button disabled={!selected} title="Tambah catatan pada slide" aria-label="Tambah catatan" className={pinning ? "on" : ""} onClick={() => {setView("focus");setPinning(v => !v);}}><StickyNote size={17}/></button>
             </nav>
             {!deck.slides.length ? (
               <div className="empty-stage">
