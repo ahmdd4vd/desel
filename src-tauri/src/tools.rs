@@ -1175,9 +1175,9 @@ pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
     if let Some((la,lo))=gps{if !(la>=-11.5&&la<=6.5&&lo>=94.5&&lo<=141.5){return true}}
     FOREIGN_WORDS.iter().any(|w|has_word(meta,w)&&!has_word(brief,w))
 }
-pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","diagram","logo","poster","document","pdf","djvu","table","chart","map of","text","letter"].iter().any(|w|has_word(title,w))}
+pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","text","letter"].iter().any(|w|has_word(title,w))}
 #[test]fn geo_city_briefs_reject_foreign(){assert!(foreign_for_brief("pempek Palembang","Scomberomorus commerson Philippines",None));assert!(!foreign_for_brief("pempek Palembang","Pempek Kuah Cuko",None));}
-#[test]fn geo_and_doc_filters(){assert!(foreign_for_brief("tenun ikat Sumba","Weaver, Looms in Bangladesh",None));assert!(foreign_for_brief("tenun Sumba","",Some((22.0,85.0))));assert!(!foreign_for_brief("tenun Sumba","Kain Sumba, Nusa Tenggara",Some((-9.6,119.9))));assert!(!foreign_for_brief("weaving in India","India loom",None));assert!(looks_like_document("File:Der Farbenfabrikant page 33.jpg"));assert!(!looks_like_document("Tenun ikat Sumba.jpg"));}
+#[test]fn geo_and_doc_filters(){assert!(foreign_for_brief("tenun ikat Sumba","Weaver, Looms in Bangladesh",None));assert!(foreign_for_brief("tenun Sumba","",Some((22.0,85.0))));assert!(!foreign_for_brief("tenun Sumba","Kain Sumba, Nusa Tenggara",Some((-9.6,119.9))));assert!(!foreign_for_brief("weaving in India","India loom",None));assert!(looks_like_document("File:Der Farbenfabrikant page 33.jpg"));assert!(looks_like_document("File:The inscription of Borobudur restoration in 1973.jpg"));assert!(!looks_like_document("Tenun ikat Sumba.jpg"));}
 
 async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
     if !ctx.settings.enable_research{return ToolOutcome{content:"error: research disabled".into(),deck:None,pause_question:None}}
