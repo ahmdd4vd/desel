@@ -1166,7 +1166,7 @@ async fn commons_meta(source:&str)->(String,Option<(f64,f64)>){
     tokio::time::timeout(std::time::Duration::from_secs(8),work).await.ok().flatten().unwrap_or_default()
 }
 
-const ID_WORDS:[&str;24]=["indonesia","sumba","ntt","bali","jawa","java","sumatera","sumatra","kalimantan","banjarmasin","sulawesi","toraja","papua","lombok","flores","maluku","aceh","yogyakarta","jakarta","nusantara","minangkabau","dayak","batak","borneo"];
+const ID_WORDS:[&str;42]=["palembang","betawi","padang","surabaya","bandung","medan","makassar","solo","madura","sunda","bugis","minang","samosir","gayo","ponorogo","pempek","rendang","gudeg","indonesia","sumba","ntt","bali","jawa","java","sumatera","sumatra","kalimantan","banjarmasin","sulawesi","toraja","papua","lombok","flores","maluku","aceh","yogyakarta","jakarta","nusantara","minangkabau","dayak","batak","borneo"];
 const FOREIGN_WORDS:[&str;24]=["india","odisha","bangladesh","vietnam","thailand","myanmar","burma","pakistan","nepal","china","philippines","laos","cambodia","sri lanka","africa","peru","guatemala","mexico","turkey","iran","morocco","japan","korea","malaysia"];
 fn has_word(hay:&str,w:&str)->bool{let h=hay.to_lowercase();let mut from=0;while let Some(p)=h[from..].find(w){let a=from+p;let b=a+w.len();let ok_a=a==0||!h[..a].chars().last().unwrap().is_alphanumeric();let ok_b=b>=h.len()||!h[b..].chars().next().unwrap().is_alphanumeric();if ok_a&&ok_b{return true}from=b;}false}
 /// True when the brief is about an Indonesian place but the file metadata/GPS says elsewhere.
@@ -1176,6 +1176,7 @@ pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
     FOREIGN_WORDS.iter().any(|w|has_word(meta,w)&&!has_word(brief,w))
 }
 pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","diagram","logo","poster","document","pdf","djvu","table","chart","map of","text","letter"].iter().any(|w|has_word(title,w))}
+#[test]fn geo_city_briefs_reject_foreign(){assert!(foreign_for_brief("pempek Palembang","Scomberomorus commerson Philippines",None));assert!(!foreign_for_brief("pempek Palembang","Pempek Kuah Cuko",None));}
 #[test]fn geo_and_doc_filters(){assert!(foreign_for_brief("tenun ikat Sumba","Weaver, Looms in Bangladesh",None));assert!(foreign_for_brief("tenun Sumba","",Some((22.0,85.0))));assert!(!foreign_for_brief("tenun Sumba","Kain Sumba, Nusa Tenggara",Some((-9.6,119.9))));assert!(!foreign_for_brief("weaving in India","India loom",None));assert!(looks_like_document("File:Der Farbenfabrikant page 33.jpg"));assert!(!looks_like_document("Tenun ikat Sumba.jpg"));}
 
 async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
