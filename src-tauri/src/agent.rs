@@ -504,6 +504,8 @@ pub async fn run_agent(
 pub const COMMONS_SPIRAL_CAP:usize=14;
 fn commons_spiral(total_calls:usize,saved_slides:usize)->bool{saved_slides==0&&total_calls>COMMONS_SPIRAL_CAP}
 /// True only when the user's brief explicitly asks for photos (not a generic "carousel").
+pub fn requested_slide_count(brief:&str)->Option<usize>{let w:Vec<String>=brief.to_lowercase().split_whitespace().map(|x|x.trim_matches(|c:char|!c.is_alphanumeric()).to_string()).collect();for i in 1..w.len(){if w[i]=="slide"||w[i]=="slides"{if let Ok(n)=w[i-1].parse::<usize>(){if (2..=20).contains(&n){return Some(n)}}}}None}
+#[test]fn slide_count_parse(){assert_eq!(requested_slide_count("Buat carousel 6 slide Instagram"),Some(6));assert_eq!(requested_slide_count("tentang slide 1 cover"),None);assert_eq!(requested_slide_count("banyak slide"),None);}
 pub fn brief_requires_photos(brief:&str)->bool{let b=brief.to_lowercase();b.contains("foto")&&["% kanvas","image-led","foto per slide","foto tiap","foto setiap","foto besar","foto yang memperlihatkan","foto minimal"].iter().any(|k|b.contains(k))}
 /// Visible slides after the cover (the last one is exempt as a closing slide) with no <img>.
 pub fn photoless_slides(deck:&Deck)->Vec<usize>{let vis:Vec<usize>=deck.slides.iter().enumerate().filter(|(_,s)|!s.hidden).map(|(i,_)|i).collect();if vis.len()<4{return vec![]}let last=*vis.last().unwrap();vis.into_iter().filter(|i|*i!=last&&!deck.slides[*i].html.to_ascii_lowercase().contains("<img")).collect()}
@@ -575,7 +577,7 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
     }
 
     let design_brief:String=history.iter().find(|m|m.role=="user").map(|m|m.content.clone()).unwrap_or_default();
-    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;
+    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;let mut count_nudges:u8=0;
     let max_turns = settings.max_turns.clamp(1, 64);
     let mut reviewed:std::collections::HashMap<String,(String,bool)>=std::collections::HashMap::new();
     let mut isolation_failed=false;
@@ -749,6 +751,12 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
 
         // ---- no tools: this is the final answer ----
         if calls.is_empty() {
+            if count_nudges<2&&turn<max_turns{if let Some(n)=requested_slide_count(&design_brief){if let Some(d)=db.get_deck(deck_id){let have=d.slides.iter().filter(|s|!s.hidden).count();if have>0&&have<n{
+                count_nudges+=1;
+                wire.push(json!({"role":"assistant","content":text_buf.clone()}));
+                wire.push(json!({"role":"system","content":format!("Brief meminta {n} slide, deck baru punya {have}. Tulis slide {} sampai {n} sekarang (slide terakhir = penutup). Jangan berhenti sebelum {n} slide ada.",have+1)}));
+                continue;
+            }}}}
             if photo_nudges<3&&turn<max_turns&&brief_requires_photos(&design_brief){
                 if let Some(d)=db.get_deck(deck_id){let missing=photoless_slides(&d);if !missing.is_empty(){
                     photo_nudges+=1;
