@@ -2362,7 +2362,8 @@ mod live_provider_tests_2 {
         }
         // Geometry feedback rounds, like the app's render bridge: measure in Chrome, pass error findings back.
         let outd0=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());
-        for round in 1..=2 {
+        let mut prev_errors=usize::MAX;let mut stalls=0;
+        for round in 1..=4 {
             let Some(deck)=db.get_deck("live_deck") else{break};
             std::fs::create_dir_all(&outd0).ok();
             for f in std::fs::read_dir(&outd0).into_iter().flatten().flatten(){let _=std::fs::remove_file(f.path());}
@@ -2373,6 +2374,8 @@ mod live_provider_tests_2 {
             let lines:Vec<String>=out.map(|o|String::from_utf8_lossy(&o.stdout).lines().map(|l|l.to_string()).collect()).unwrap_or_default();
             println!("[live] geometry round {round}: {} error findings", lines.len());
             if lines.is_empty(){break}
+            if lines.len()>=prev_errors{stalls+=1;if stalls>=2{println!("[live] geometry stalled (retry provider tanpa progres); berhenti dengan {} error residu",lines.len());break}}else{stalls=0}
+            prev_errors=lines.len();
             let msg2 = ChatMessage { id: new_id("msg"), deck_id: "live_deck".into(), role: "user".into(), content: "Perbaiki temuan geometri render ini pada slide yang disebut.".into(), tool_calls: Vec::new(), tool_call_id: None, reasoning_content: String::new(), streaming: false, created_at: chrono::Utc::now().to_rfc3339() };
             let _ = db.append_message(&msg2);
             let hist=db.list_messages("live_deck");
