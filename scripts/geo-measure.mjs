@@ -30,6 +30,6 @@ const titles=fs.existsSync(`${dir}/titles.json`)?JSON.parse(fs.readFileSync(`${d
 const n=fs.readdirSync(dir).filter(f=>/^\d+\.html$/.test(f)).length;
 const b=await puppeteer.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',args:['--no-sandbox']});const p=await b.newPage();await p.setViewport({width:1080,height:1350});
 for(let i=0;i<n;i++){await p.setContent(fs.readFileSync(`${dir}/${i}.html`,'utf8'),{waitUntil:'load'});await p.addScriptTag({content:fs.readFileSync(gjs,'utf8')});
-const r=(await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).concat(await textContrast(p)).filter(x=>x.severity==='error').map(x=>x.message);
+const r=(await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).concat(await textContrast(p)).filter(x=>x.severity==='error'||(process.env.GEO_WARN&&x.rule===process.env.GEO_WARN)).map(x=>x.message);
 for(const m of r)console.log(`Slide ${i+1} ("${titles[i]||''}"): ${m}`);}
 await b.close();
