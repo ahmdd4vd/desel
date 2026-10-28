@@ -887,6 +887,19 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     let mine=keys(&slide.html);
     let dup:Vec<String>=deck.slides.iter().enumerate().filter(|(j,s)|*j!=index&&!s.hidden&&!keys(&s.html).is_disjoint(&mine)).map(|(j,_)|(j+1).to_string()).collect();
     if !dup.is_empty(){out.push(error("repeated-photo",format!("Foto identik juga dipakai di slide {}. Satu foto hanya boleh muncul sekali per carousel (crop berbeda bukan foto baru): panggil search_commons untuk foto lain, atau ganti dengan angka/diagram bila tidak ada foto yang relevan.",dup.join(", "))))}
+    // similar-photo: same photographer credited on another slide (visually similar shots)
+    let artist=|html:&str|->Option<String>{
+        let lc=html.to_lowercase();let i=lc.find("foto:")?;
+        let rest=&lc[i+5..];
+        let end=rest.find(|c:char|c=='<'||c=='/'||c=='(').unwrap_or(rest.len());
+        let a=rest[..end].trim().to_string();
+        if a.len()>=3{Some(a)}else{None}
+    };
+    if let Some(a)=artist(&slide.html){
+        if deck.slides.iter().take(index).filter(|s|!s.hidden).any(|s|artist(&s.html).as_deref()==Some(a.as_str())){
+            out.push(warn("similar-photo",format!("Fotografer \"{a}\" juga dikreditkan di slide lain dalam deck ini. Foto dari fotografer/seri yang sama cenderung terlihat mirip antar slide: usahakan tiap slide memakai sumber visual yang berbeda supaya carousel terasa beragam.")))
+        }
+    }
     // photo-sparse: most slides lack any <img>
     let visible=deck.slides.iter().filter(|s|!s.hidden).count();
     let with_img=deck.slides.iter().filter(|s|!s.hidden&&s.html.to_ascii_lowercase().contains("<img")).count();
