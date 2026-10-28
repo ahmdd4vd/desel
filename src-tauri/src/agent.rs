@@ -2354,9 +2354,9 @@ mod live_provider_tests_2 {
         for attempt in 1..=3 {
             let have=db.get_deck("live_deck").map(|d|d.slides.len()).unwrap_or(0);
             let nophoto:Vec<usize>=db.get_deck("live_deck").map(|d|photoless_slides(&d)).unwrap_or_default();
-            if have>=want&&nophoto.is_empty(){break;}
+            if have==want&&nophoto.is_empty(){break;}
             eprintln!("[live] deck has {have}/{want} slides; continuation attempt {attempt}");
-            if have>0{let m=ChatMessage{id:new_id("msg"),deck_id:"live_deck".into(),role:"user".into(),content:format!("Lanjutkan deck yang sudah ada: baru {have} dari {want} slide; slide tanpa foto: {:?} (nomor mulai 0). Lengkapi slide sisanya dan pasang foto Commons di slide tanpa foto (kata kunci umum: nama hidangan/objek saja), tanpa mengulang yang sudah ada.",nophoto),tool_calls:Vec::new(),tool_call_id:None,reasoning_content:String::new(),streaming:false,created_at:chrono::Utc::now().to_rfc3339()};let _=db.append_message(&m);}
+            if have>0{let content=if have>want{format!("Deck sekarang berisi {have} slide, padahal brief meminta PERSIS {want} slide. Gabungkan atau hapus slide yang paling lemah sampai tersisa PERSIS {want} slide; slide yang dipertahankan jangan diubah.")}else{format!("Lanjutkan deck yang sudah ada: baru {have} dari {want} slide; slide tanpa foto: {:?} (nomor mulai 0). Lengkapi slide sisanya dan pasang foto Commons di slide tanpa foto (kata kunci umum: nama hidangan/objek saja), tanpa mengulang yang sudah ada.",nophoto)};let m=ChatMessage{id:new_id("msg"),deck_id:"live_deck".into(),role:"user".into(),content,tool_calls:Vec::new(),tool_call_id:None,reasoning_content:String::new(),streaming:false,created_at:chrono::Utc::now().to_rfc3339()};let _=db.append_message(&m);}
             let hist=db.list_messages("live_deck");let (c2,_)=headless_channel(path.clone());
             run_agent(&db,&settings,"live_deck",hist,Vec::new(),std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),c2).await;
         }
