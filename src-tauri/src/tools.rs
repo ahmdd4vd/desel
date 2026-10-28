@@ -161,7 +161,7 @@ pub fn tool_specs(settings: &AppSettings) -> Value {
         tools.push(json!({"type":"function","function":{"name":"review_render","description":"Request an actual rendered PNG of ONE current slide for visual critique (not HTML/lint). Available only with vision enabled. Inspect layout, image crop, contrast, hierarchy, reference match, overflow. Fix issues and request another render. Do not claim you saw pixels unless image returned. Desktop must be open.","parameters":{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"]}}}));
     }
     if settings.enable_research {
-        tools.push(json!({"type":"function","function":{"name":"search_commons","description":"Cari DAN impor satu foto nyata dari Wikimedia Commons untuk satu slide. Beri kata kunci pendek (Inggris atau nama tempat/objek) dan pesan slide. Alat ini mencari, memilih hasil berformat foto dengan fotografer bernama, mencoba ulang saat 429/503, mengimpor thumbnail 1280px, dan mengembalikan ID aset serta KREDIT TERVERIFIKASI. Pakai ini, jangan menebak URL Commons.","parameters":{"type":"object","properties":{"query":{"type":"string"},"role":{"type":"string"},"slideMessage":{"type":"string"}},"required":["query","role","slideMessage"]}}}));
+        tools.push(json!({"type":"function","function":{"name":"search_commons","description":"Cari DAN impor satu foto nyata dari Wikimedia Commons untuk satu slide. Beri kata kunci dan pesan slide. Kata kunci = nama SPESIFIK subjek: untuk deck tentang tokoh/orang, SELALU mulai dari nama lengkap tokoh atau nama + peristiwa/tempat/karya (mis. \"Susi Pudjiastuti\", \"Susi Air\", \"B J Habibie pesawat\") - kata kunci generik tanpa nama (mis. \"fishing boat\", \"pesawat\", \"pantai\") hampir pasti ditolak juri untuk deck tokoh. Untuk hidangan/benda/tempat, pakai namanya yang spesifik (mis. \"tari piring\", \"kopi Gayo\"). Bahasa Inggris atau Indonesia sama-sama boleh; coba keduanya bila satu kosong. Alat ini mencari, memilih hasil berformat foto dengan fotografer bernama, mencoba ulang saat 429/503, mengimpor thumbnail 1280px, dan mengembalikan ID aset serta KREDIT TERVERIFIKASI. Pakai ini, jangan menebak URL Commons.","parameters":{"type":"object","properties":{"query":{"type":"string"},"role":{"type":"string"},"slideMessage":{"type":"string"}},"required":["query","role","slideMessage"]}}}));
         tools.push(json!({"type":"function","function":{"name":"import_image","description":"Download an observed public image URL into this deck's asset library. Supply the actual source page, intended role and rights note. Returns an asset ID. Use use_asset in slide HTML rather than repeating base64. Crop/layout via CSS object-fit/object-position. Not video, not image generation, and not a license grant.","parameters":{"type":"object","properties":{"url":{"type":"string"},"sourceUrl":{"type":"string"},"role":{"type":"string"},"rightsNote":{"type":"string"}},"required":["url","sourceUrl","role","rightsNote"]}}}));
         tools.push(json!({"type":"function","function":{"name":"github_trending","description":"Read GitHub Trending primary daily/weekly/monthly list with timestamp and actual repo links, not search rank. Verify each selected repo/docs before claims. Public page can block or change.","parameters":{"type":"object","properties":{"since":{"type":"string","enum":["daily","weekly","monthly"]}},"required":[]}}}));
     }
@@ -1132,6 +1132,25 @@ async fn commons_search_json(query:&str)->Result<String,String>{
     Err(last)
 }
 
+/// Files in Category:<name> as candidates, same JSON shape as a search.
+async fn commons_category_json(cat:&str)->Result<String,String>{
+    let c:String=cat.chars().filter(|c|c.is_alphanumeric()||*c==' '||*c=='-').collect::<String>().split_whitespace().collect::<Vec<_>>().join("+");
+    if c.is_empty(){return Err("nama kategori kosong".into())}
+    let api=format!("https://commons.wikimedia.org/w/api.php?action=query&generator=categorymembers&gcmtitle=Category:{c}&gcmtype=file&gcmlimit=20&prop=imageinfo&iiprop=url%7Csize&iiurlwidth=1280&format=json");
+    let mut last="tidak ada percobaan".to_string();
+    for attempt in 0..2{
+        if attempt>0{tokio::time::sleep(std::time::Duration::from_secs(3*attempt)).await;}
+        let url=validate_image_url(&api).map_err(|e|e.to_string())?;
+        let client=pinned_client(&url).await.map_err(|e|e.to_string())?;
+        match client.get(url).header("User-Agent","DeselCarouselApp/1.0").send().await{
+            Ok(r)if r.status().is_success()=>{if let Ok(t)=r.text().await{return Ok(t)}}
+            Ok(r)=>{last=format!("status {}",r.status());}
+            Err(e)=>{last=e.to_string();}
+        }
+    }
+    Err(last)
+}
+
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum Verdict{Yes,No,Unsure,Unavailable}
 
@@ -1231,11 +1250,16 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if words.len()<=floor{break}
         words.pop();
     }
-    if cands.is_empty(){return ToolOutcome{content:format!("error: Commons tidak punya foto layak untuk \"{query}\". Coba kata kunci lebih umum atau berbeda."),deck:None,pause_question:None}}
+    let orig=query.trim().to_string();
+    let mut cat_done=false;
+    if cands.is_empty(){cat_done=true;if let Ok(t2)=commons_category_json(&orig).await{cands=commons_candidates(&t2)}}
+    if cands.is_empty(){return ToolOutcome{content:format!("error: Commons tidak punya foto layak untuk \"{query}\" (pencarian teks dan kategori kosong). Coba kata kunci lebih umum atau berbeda."),deck:None,pause_question:None}}
     let brief:String=ctx.db.list_messages(&ctx.deck_id).into_iter().find(|m|m.role=="user").map(|m|m.content).unwrap_or_default();
     let mut tried=vec![];
     let mut named=0;
-    for (thumb,page,title) in cands.into_iter().take(8){
+    let mut pool=cands;
+    'pools: loop{
+    for (thumb,page,title) in pool.into_iter().take(8){
         if named>=4{break}
         if {let c=commons_credit(&page).await;c.is_empty()||placeholder_artist(c.split('|').next().unwrap_or(""))}{tried.push(format!("{title}: fotografer tidak bernama"));continue}
         named+=1;
@@ -1254,7 +1278,12 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if out.content.starts_with("Imported "){let mut out=out;if !tried.is_empty(){out.content.push_str(&format!("\nCatatan filter (kandidat ditolak sebelum ini): {}",tried.join(" | ")));}eprintln!("[filter] diterima \"{title}\"; ditolak: {}",tried.join(" | "));return out}
         tried.push(format!("{title}: {}",out.content.lines().next().unwrap_or("").chars().take(110).collect::<String>()));
     }
-    ToolOutcome{content:format!("error: tidak ada foto yang lolos untuk \"{query}\". Dicoba: {}. Pakai kata kunci lain.",tried.join(" | ")),deck:None,pause_question:None}
+        if cat_done{break}
+        cat_done=true;
+        match commons_category_json(&orig).await{Ok(t2)=>{pool=commons_candidates(&t2)},Err(_)=>break}
+        if pool.is_empty(){break}
+    }
+    ToolOutcome{content:format!("error: tidak ada foto yang lolos untuk \"{query}\". Dicoba: {}. STRATEGI KATA KUNCI: untuk deck tokoh/orang pakai nama lengkap tokoh persis atau nama + peristiwa/tempat/karya (mis. \"Susi Pudjiastuti\", \"Susi Air\"), ejaan Inggris dan Indonesia; kata kunci generik tanpa nama hampir selalu ditolak juri. Untuk topik lain pakai nama spesifik subjeknya.",tried.join(" | ")),deck:None,pause_question:None}
 }
 
 pub const IMPORT_CAP:usize=14;
