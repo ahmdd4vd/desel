@@ -15,6 +15,15 @@ async function creditContrast(p){
   return issues;
 }
 
+// Mean luminance of the slide with text hidden: warn when the whole slide is very dark.
+async function darkCheck(p){
+  await p.addStyleTag({content:'*{color:transparent !important;text-shadow:none !important;-webkit-text-fill-color:transparent !important}'});
+  const b64=await p.screenshot({encoding:'base64',clip:{x:0,y:0,width:1080,height:1350}});
+  const mean=await p.evaluate(async(b64)=>{const img=new Image();img.src='data:image/png;base64,'+b64;await img.decode();const cv=document.createElement('canvas');cv.width=img.width;cv.height=img.height;const g=cv.getContext('2d');g.drawImage(img,0,0);const d=g.getImageData(0,0,cv.width,cv.height).data;let s=0,n=0;for(let i=0;i<d.length;i+=16){s+=.2126*d[i]+.7152*d[i+1]+.0722*d[i+2];n++}return s/n},b64);
+  if(mean<38)return [{rule:'slide-dark',severity:'warn',message:`Slide ini sangat gelap (luminansi rata-rata ${Math.round(mean)}/255): di feed ponsel akan tenggelam. Terangkan foto/latar atau tambah kontras.`}];
+  return [];
+}
+
 // Pixel check for ALL text: hide every glyph, screenshot the page once, then per text element compare its color (with alpha) to the pixels behind it.
 async function textContrast(p){
   const items=await p.evaluate(()=>{const out=[];for(const el of Array.from(document.body.querySelectorAll('*'))){const own=Array.from(el.childNodes).filter(n=>n.nodeType===3).map(n=>n.textContent).join(' ').replace(/\s+/g,' ').trim();const eff=own.length>=4?own:(/^H[1-3]$/.test(el.tagName)?(el.textContent||'').replace(/\s+/g,' ').trim():'');if(eff.length<4)continue;const cs=getComputedStyle(el);if(cs.display==='none'||cs.visibility==='hidden')continue;let op=1;for(let q=el;q&&q!==document.body;q=q.parentElement)op*=Number(getComputedStyle(q).opacity);const m=cs.color.match(/rgba?\(([^)]+)\)/);const c=m[1].split(',').map(Number);const a=(c.length>3?c[3]:1)*op;if(a<.3)continue;const rg=document.createRange();rg.selectNodeContents(el);const lines=Array.from(rg.getClientRects()).filter(r=>r.width>=8&&r.height>=8&&r.right>0&&r.bottom>0&&r.left<1080&&r.top<1350);for(const r of lines)out.push({x:Math.max(0,r.left),y:Math.max(0,r.top),w:Math.min(r.width,1080-Math.max(0,r.left)),h:Math.min(r.height,1350-Math.max(0,r.top)),c:[c[0],c[1],c[2]],a,text:eff.slice(0,36),fs:parseFloat(cs.fontSize)})}return out});
@@ -31,6 +40,6 @@ const titles=fs.existsSync(`${dir}/titles.json`)?JSON.parse(fs.readFileSync(`${d
 const n=fs.readdirSync(dir).filter(f=>/^\d+\.html$/.test(f)).length;
 const b=await puppeteer.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',args:['--no-sandbox']});const p=await b.newPage();await p.setViewport({width:1080,height:1350});
 for(let i=0;i<n;i++){await p.setContent(fs.readFileSync(`${dir}/${i}.html`,'utf8'),{waitUntil:'load'});await p.addScriptTag({content:fs.readFileSync(gjs,'utf8')});
-const r=(await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).concat(await textContrast(p)).filter(x=>x.severity==='error'||(process.env.GEO_WARN&&x.rule===process.env.GEO_WARN)).map(x=>x.message);
+const r=(await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).concat(await textContrast(p)).concat(await darkCheck(p)).filter(x=>x.severity==='error'||(process.env.GEO_WARN&&x.rule===process.env.GEO_WARN)).map(x=>x.message);
 for(const m of r)console.log(`Slide ${i+1} ("${titles[i]||''}"): ${m}`);}
 await b.close();
