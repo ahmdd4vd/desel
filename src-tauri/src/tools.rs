@@ -1041,6 +1041,15 @@ async fn fetch_url(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
 }
 
 /// Real creator from the Wikimedia Commons file page (API extmetadata). Empty when unavailable.
+/// Strip boilerplate like "This image was taken by ..." from a Commons Artist field so credits read as a name.
+pub fn clean_artist_name(a:&str)->String{
+    let re=regex::Regex::new(r"(?i)^\s*(this (image|photo|picture|photograph|work|file|media)( was)? (taken|created|made|shot|captured|produced) by|photo(graph)? (taken )?by|image (taken )?by|picture (taken )?by)\s*:?\s*").unwrap();
+    let t=re.replace(a,"");
+    let t=t.trim().trim_end_matches('.').trim().trim_start_matches("the ").trim();
+    if t.len()<3{a.to_string()}else{t.to_string()}
+}
+#[test]fn artist_boilerplate_stripped(){assert_eq!(clean_artist_name("This image was taken by the NASA Expedition 20 crew."),"NASA Expedition 20 crew");assert_eq!(clean_artist_name("Photo by Gunawan Kartapranata"),"Gunawan Kartapranata");assert_eq!(clean_artist_name("Rijksmuseum"),"Rijksmuseum");}
+
 async fn commons_credit(source:&str)->String{
     let work=async{
         let t=source.split("/wiki/").nth(1)?; if !source.contains("commons.wikimedia.org"){return None;}
@@ -1054,6 +1063,7 @@ async fn commons_credit(source:&str)->String{
         let artist=em.get("Artist")?.get("value")?.as_str()?;
         let tag=regex::Regex::new(r"(?s)<[^>]*>").ok()?;
         let a=tag.replace_all(artist,"").replace("&amp;","&").trim().to_string();
+        let a=clean_artist_name(&a);
         let lic=em.get("LicenseShortName").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_string();
         if a.is_empty()||a.len()>80{return None;}
         Some(format!("{a}|{lic}"))
