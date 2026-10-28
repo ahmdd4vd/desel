@@ -2298,6 +2298,37 @@ mod live_provider_tests_2 {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Headless render bridge: answers render_request events like the app's webview does, using Chrome + geometry.ts.
+    fn headless_channel(path: std::path::PathBuf) -> (Channel<AgentEvent>, Arc<Mutex<Vec<String>>>) {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let db2 = Db::open(path).expect("db2");
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(raw) = body {
+                let ev: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                if ev["type"] == "render_request" {
+                    let rid = ev["requestId"].as_str().or_else(|| ev["request_id"].as_str()).unwrap_or("").to_string();
+                    let rev = ev["revision"].as_str().unwrap_or("").to_string();
+                    let idx = ev["index"].as_u64().unwrap_or(0) as usize;
+                    let html = ev["candidate"]["slide"]["html"].as_str().map(|s| s.to_string())
+                        .or_else(|| db2.get_deck("live_deck").and_then(|d| d.slides.get(idx).map(|s| s.html.clone()))).unwrap_or_default();
+                    let f = format!("/tmp/hl-{rid}.html");
+                    std::fs::write(&f, html).ok();
+                    let out = std::process::Command::new("node").arg("/home/sandbox/w/scripts/geo-measure.mjs").arg("--file").arg(&f).current_dir("/home/sandbox/w").output().ok();
+                    let issues: Vec<Value> = out.and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or_default();
+                    let msgs: Vec<String> = issues.iter().filter(|i| i["severity"] == "error").map(|i| format!("{}: {}", i["rule"].as_str().unwrap_or(""), i["message"].as_str().unwrap_or(""))).collect();
+                    let mut receipt = json!({"revision": rev, "issues": msgs});
+                    if ev["candidate"].is_object() { receipt["accepted"] = json!(true); }
+                    let asset = Asset { provenance: None, reference_role: String::new(), reference_status: String::new(), id: new_id("review"), deck_id: Some("live_deck".into()), name: format!("__render_receipt_{rid}"), mime: "application/json".into(), data: receipt.to_string(), profile: None, created_at: chrono::Utc::now().to_rfc3339() };
+                    db2.add_asset(&asset).ok();
+                }
+                sink.lock().unwrap().push(raw.to_string());
+            }
+            Ok(())
+        });
+        (channel, seen)
+    }
+
     /// Live photo-brief session; topic from LIVE_BRIEF env. Writes slides to /tmp/live-out.
     #[tokio::test]
     #[ignore]
@@ -2308,7 +2339,7 @@ mod live_provider_tests_2 {
         let db = crate::db::Db::open(path.clone()).expect("db");
         let msg = ChatMessage { id: new_id("msg"), deck_id: "live_deck".into(), role: "user".into(), content: brief, tool_calls: Vec::new(), tool_call_id: None, reasoning_content: String::new(), streaming: false, created_at: chrono::Utc::now().to_rfc3339() };
         let _ = db.append_message(&msg);
-        let (channel, seen) = collector();
+        let (channel, seen) = headless_channel(path.clone());
         run_agent(&db, &settings, "live_deck", vec![msg], Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel).await;
         // Geometry feedback rounds, like the app's render bridge: measure in Chrome, pass error findings back.
         let outd0=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());
@@ -2326,7 +2357,7 @@ mod live_provider_tests_2 {
             let msg2 = ChatMessage { id: new_id("msg"), deck_id: "live_deck".into(), role: "user".into(), content: "Perbaiki temuan geometri render ini pada slide yang disebut.".into(), tool_calls: Vec::new(), tool_call_id: None, reasoning_content: String::new(), streaming: false, created_at: chrono::Utc::now().to_rfc3339() };
             let _ = db.append_message(&msg2);
             let hist=db.list_messages("live_deck");
-            let (channel2, seen2) = collector();
+            let (channel2, seen2) = headless_channel(path.clone());
             run_agent(&db, &settings, "live_deck", hist, lines, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel2).await;
             let _=seen2;
         }
