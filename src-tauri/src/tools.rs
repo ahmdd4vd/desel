@@ -161,6 +161,7 @@ pub fn tool_specs(settings: &AppSettings) -> Value {
         tools.push(json!({"type":"function","function":{"name":"review_render","description":"Request an actual rendered PNG of ONE current slide for visual critique (not HTML/lint). Available only with vision enabled. Inspect layout, image crop, contrast, hierarchy, reference match, overflow. Fix issues and request another render. Do not claim you saw pixels unless image returned. Desktop must be open.","parameters":{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"]}}}));
     }
     if settings.enable_research {
+        tools.push(json!({"type":"function","function":{"name":"search_commons","description":"Cari DAN impor satu foto nyata dari Wikimedia Commons untuk satu slide. Beri kata kunci pendek (Inggris atau nama tempat/objek) dan pesan slide. Alat ini mencari, memilih hasil berformat foto dengan fotografer bernama, mencoba ulang saat 429/503, mengimpor thumbnail 1280px, dan mengembalikan ID aset serta KREDIT TERVERIFIKASI. Pakai ini, jangan menebak URL Commons.","parameters":{"type":"object","properties":{"query":{"type":"string"},"role":{"type":"string"},"slideMessage":{"type":"string"}},"required":["query","role","slideMessage"]}}}));
         tools.push(json!({"type":"function","function":{"name":"import_image","description":"Download an observed public image URL into this deck's asset library. Supply the actual source page, intended role and rights note. Returns an asset ID. Use use_asset in slide HTML rather than repeating base64. Crop/layout via CSS object-fit/object-position. Not video, not image generation, and not a license grant.","parameters":{"type":"object","properties":{"url":{"type":"string"},"sourceUrl":{"type":"string"},"role":{"type":"string"},"rightsNote":{"type":"string"}},"required":["url","sourceUrl","role","rightsNote"]}}}));
         tools.push(json!({"type":"function","function":{"name":"github_trending","description":"Read GitHub Trending primary daily/weekly/monthly list with timestamp and actual repo links, not search rank. Verify each selected repo/docs before claims. Public page can block or change.","parameters":{"type":"object","properties":{"since":{"type":"string","enum":["daily","weekly","monthly"]}},"required":[]}}}));
     }
@@ -239,6 +240,7 @@ pub async fn execute(ctx: &ToolContext<'_>, name: &str, args: &Value) -> ToolOut
         "fetch_url" => fetch_url(ctx, args).await,
         "github_trending" => {let since=arg_str(args,"since");let since=if ["daily","weekly","monthly"].contains(&since.as_str()){since.as_str()}else{"daily"};if !ctx.settings.enable_research {ToolOutcome{content:"error: research disabled".into(),deck:None,pause_question:None}}else{ToolOutcome{content:crate::research::github_trending(since).await.unwrap_or_else(|e|format!("error: {e}")),deck:None,pause_question:None}}},
         "import_image" => import_image(ctx,args).await,
+        "search_commons" => search_commons(ctx,args).await,
         other => ToolOutcome {
             content: format!("Unknown tool: {other}"),
             deck: None,
@@ -1023,11 +1025,100 @@ async fn fetch_url(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     }
 }
 
+/// Real creator from the Wikimedia Commons file page (API extmetadata). Empty when unavailable.
+async fn commons_credit(source:&str)->String{
+    let work=async{
+        let t=source.split("/wiki/").nth(1)?; if !source.contains("commons.wikimedia.org"){return None;}
+        let title=t.split(['#','?']).next()?;
+        let api=format!("https://commons.wikimedia.org/w/api.php?action=query&titles={title}&prop=imageinfo&iiprop=extmetadata&format=json");
+        let url=validate_image_url(&api).ok()?;let client=pinned_client(&url).await.ok()?;
+        let txt=client.get(url).header("User-Agent","DeselCarouselApp/1.0").send().await.ok()?.text().await.ok()?;
+        let v:serde_json::Value=serde_json::from_str(&txt).ok()?;
+        let pages=v.get("query")?.get("pages")?.as_object()?;
+        let em=pages.values().next()?.get("imageinfo")?.get(0)?.get("extmetadata")?;
+        let artist=em.get("Artist")?.get("value")?.as_str()?;
+        let tag=regex::Regex::new(r"(?s)<[^>]*>").ok()?;
+        let a=tag.replace_all(artist,"").replace("&amp;","&").trim().to_string();
+        let lic=em.get("LicenseShortName").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_string();
+        if a.is_empty()||a.len()>80{return None;}
+        Some(format!("{a}|{lic}"))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(6),work).await.ok().flatten().unwrap_or_default()
+}
+
+/// Candidates (thumb url, file page url, title) from a Commons generator=search JSON, best rank first, photo formats only.
+pub fn commons_candidates(json_text:&str)->Vec<(String,String,String)>{
+    let Ok(v)=serde_json::from_str::<serde_json::Value>(json_text) else{return vec![]};
+    let Some(pages)=v.get("query").and_then(|q|q.get("pages")).and_then(|p|p.as_object()) else{return vec![]};
+    let mut rows:Vec<(i64,String,String,String)>=vec![];
+    for p in pages.values(){
+        let title=p.get("title").and_then(|t|t.as_str()).unwrap_or("").to_string();
+        let low=title.to_lowercase();
+        if !(low.ends_with(".jpg")||low.ends_with(".jpeg")||low.ends_with(".png")||low.ends_with(".webp")){continue}
+        let Some(ii)=p.get("imageinfo").and_then(|i|i.get(0)) else{continue};
+        let thumb=ii.get("thumburl").and_then(|t|t.as_str()).unwrap_or("");
+        let page=ii.get("descriptionurl").and_then(|t|t.as_str()).unwrap_or("");
+        let w=ii.get("width").and_then(|x|x.as_i64()).unwrap_or(0);
+        if thumb.is_empty()||page.is_empty()||w<900{continue}
+        rows.push((p.get("index").and_then(|x|x.as_i64()).unwrap_or(99),thumb.to_string(),page.to_string(),title));
+    }
+    rows.sort_by_key(|r|r.0);
+    rows.into_iter().map(|r|(r.1,r.2,r.3)).collect()
+}
+
+async fn commons_search_json(query:&str)->Result<String,String>{
+    let q:String=query.chars().filter(|c|c.is_alphanumeric()||*c==' '||*c=='-').collect::<String>().split_whitespace().collect::<Vec<_>>().join("+");
+    if q.is_empty(){return Err("kata kunci kosong".into())}
+    let api=format!("https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch={q}&gsrlimit=12&prop=imageinfo&iiprop=url%7Csize&iiurlwidth=1280&format=json");
+    let mut last="tidak ada percobaan".to_string();
+    for attempt in 0..4{
+        if attempt>0{tokio::time::sleep(std::time::Duration::from_secs(3*attempt)).await;}
+        let url=validate_image_url(&api).map_err(|e|e.to_string())?;
+        let client=pinned_client(&url).await.map_err(|e|e.to_string())?;
+        match client.get(url).header("User-Agent","DeselCarouselApp/1.0").send().await{
+            Ok(r)if r.status().is_success()=>{if let Ok(t)=r.text().await{return Ok(t)}}
+            Ok(r)=>{last=format!("status {}",r.status());}
+            Err(e)=>{last=e.to_string();}
+        }
+    }
+    Err(last)
+}
+
+async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
+    if !ctx.settings.enable_research{return ToolOutcome{content:"error: research disabled".into(),deck:None,pause_question:None}}
+    let query=arg_str(args,"query");let role=arg_str(args,"role");let msg=arg_str(args,"slideMessage");
+    if query.trim().is_empty()||role.trim().is_empty(){return ToolOutcome{content:"error: query dan role wajib".into(),deck:None,pause_question:None}}
+    let mut words:Vec<&str>=query.split_whitespace().collect();
+    let floor=if words.len()>=2{2}else{1};
+    let mut cands=vec![];
+    loop{
+        let q=words.join(" ");
+        match commons_search_json(&q).await{Ok(t)=>{cands=commons_candidates(&t);if !cands.is_empty(){break}},Err(e)=>return ToolOutcome{content:format!("error: pencarian Commons gagal ({e}) setelah 4 percobaan. Coba kata kunci lain atau ulangi sebentar lagi."),deck:None,pause_question:None}}
+        if words.len()<=floor{break}
+        words.pop();
+    }
+    if cands.is_empty(){return ToolOutcome{content:format!("error: Commons tidak punya foto layak untuk \"{query}\". Coba kata kunci lebih umum atau berbeda."),deck:None,pause_question:None}}
+    let mut tried=vec![];
+    let mut named=0;
+    for (thumb,page,title) in cands.into_iter().take(8){
+        if named>=4{break}
+        if commons_credit(&page).await.is_empty(){tried.push(format!("{title}: fotografer tidak bernama"));continue}
+        named+=1;
+        let a=json!({"url":thumb,"sourceUrl":page,"role":role,"slideMessage":msg,"rightsNote":"Wikimedia Commons, lisensi bebas; fotografer dari halaman file"});
+        let out=import_image(ctx,&a).await;
+        if out.content.starts_with("Imported "){return out}
+        tried.push(format!("{title}: {}",out.content.lines().next().unwrap_or("").chars().take(110).collect::<String>()));
+    }
+    ToolOutcome{content:format!("error: tidak ada foto yang lolos untuk \"{query}\". Dicoba: {}. Pakai kata kunci lain.",tried.join(" | ")),deck:None,pause_question:None}
+}
+
 async fn import_image(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
  if !ctx.settings.enable_research{return ToolOutcome{content:"research disabled".into(),deck:None,pause_question:None}}
  let url=arg_str(args,"url");let source=arg_str(args,"sourceUrl");let role=arg_str(args,"role");let rights=arg_str(args,"rightsNote");
  if source.trim().is_empty()||role.trim().is_empty()||rights.trim().is_empty(){return ToolOutcome{content:"error: sourceUrl, role and rightsNote required; do not invent licensing permission".into(),deck:None,pause_question:None}}
- let result=async{let provenance=crate::model::AssetProvenance{source_url:source.clone(),creator:String::new(),rights_note:rights.clone(),alt_text:String::new()};provenance.validate()?;let data_uri=fetch_image_data_uri(&url,5*1024*1024).await?;let (prefix,data)=data_uri.split_once(',').ok_or("invalid image")?;let mime=prefix.trim_start_matches("data:").trim_end_matches(";base64");let id=crate::db::new_id("asset");use base64::Engine as _;let profile=base64::engine::general_purpose::STANDARD.decode(data).ok().and_then(|bytes|crate::palette::analyse(&bytes));let asset=Asset {provenance:Some(provenance),reference_role:if ["cover","body","closer","asset"].contains(&role.as_str()){role.clone()}else{String::new()},reference_status:"candidate".into(),id:id.clone(),deck_id:Some(ctx.deck_id.clone()),name:role.clone(),mime:mime.into(),data:data.into(),profile,created_at:chrono::Utc::now().to_rfc3339()};ctx.db.add_asset(&asset).map_err(|e|e.to_string())?;Ok::<_,String>(format!("Imported {id}. Use <img src=\"asset:{id}\"> in write_slide. Source and rights note stored; rights are your supplied note, not verified permission."))}.await;
+ let cc=commons_credit(&source).await;let (cc_name,cc_lic)=cc.split_once('|').map(|(a,b)|(a.to_string(),b.to_string())).unwrap_or_default();
+ let result=async{let provenance=crate::model::AssetProvenance{source_url:source.clone(),creator:cc_name.clone(),rights_note:rights.clone(),alt_text:String::new()};provenance.validate()?;let data_uri=fetch_image_data_uri(&url,5*1024*1024).await?;let (prefix,data)=data_uri.split_once(',').ok_or("invalid image")?;let mime=prefix.trim_start_matches("data:").trim_end_matches(";base64");let id=crate::db::new_id("asset");use base64::Engine as _;let profile=base64::engine::general_purpose::STANDARD.decode(data).ok().and_then(|bytes|crate::palette::analyse(&bytes));let asset=Asset {provenance:Some(provenance),reference_role:if ["cover","body","closer","asset"].contains(&role.as_str()){role.clone()}else{String::new()},reference_status:"candidate".into(),id:id.clone(),deck_id:Some(ctx.deck_id.clone()),name:role.clone(),mime:mime.into(),data:data.into(),profile,created_at:chrono::Utc::now().to_rfc3339()};ctx.db.add_asset(&asset).map_err(|e|e.to_string())?;Ok::<_,String>(format!("Imported {id}. Use <img src=\"asset:{id}\"> in write_slide. Source and rights note stored; rights are your supplied note, not verified permission."))}.await;
+ let result=result.map(|s|if cc_name.is_empty(){format!("{s}\nKREDIT: nama fotografer TIDAK terverifikasi untuk foto ini. Jangan menulis kredit karangan; cari foto lain bila perlu kredit, atau hapus baris kredit.")}else{format!("{s}\nKREDIT TERVERIFIKASI (pakai persis): Foto: {cc_name} / Wikimedia{}",if cc_lic.is_empty(){String::new()}else{format!(" ({cc_lic})")})});
  ToolOutcome{content:result.unwrap_or_else(|e|{let assets=ctx.db.list_assets(&ctx.deck_id).into_iter().filter(|a|a.id.starts_with("asset_")).map(|a|format!("{}: {}",a.id,a.name.chars().take(120).collect::<String>())).collect::<Vec<_>>();format!("image import failed: {e}\nExisting imported assets (not lost): {}. Stop repeated asset hunting when existing relevant screenshots suffice; disclose any missing artwork instead of inventing it.",assets.join("; "))}),deck:None,pause_question:None}
 }
 
@@ -1389,3 +1480,7 @@ pub async fn prepare_layout_candidate(ctx:&ToolContext<'_>,name:&str,args:&Value
 }
 
 #[cfg(test)]mod asset_prefix_tests{use super::*;#[test]fn asset_resolution_does_not_replace_prefixes(){let path=std::env::temp_dir().join(format!("prefix-{}.db",crate::db::new_id("t")));let db=Db::open(path.clone()).unwrap();for(id,data)in[("a","first"),("ab","second")]{db.add_asset(&Asset{id:id.into(),deck_id:Some("d".into()),name:"fixture".into(),mime:"image/png".into(),data:data.into(),profile:None,created_at:"".into(),provenance:None,reference_role:"".into(),reference_status:"".into()}).unwrap();}let c=ToolContext{db:&db,deck_id:"d".into(),settings:AppSettings::default()};assert_eq!(resolve_assets(&c,"asset:a asset:ab asset:abc"),"data:image/png;base64,first data:image/png;base64,second asset:abc");drop(db);let _=std::fs::remove_file(path);}}
+
+#[cfg(test)]mod commons_search_tests{use super::*;
+#[test]fn candidates_keep_ranked_photos_only(){let j=r#"{"query":{"pages":{"1":{"title":"File:B.svg","index":1,"imageinfo":[{"thumburl":"t1","descriptionurl":"p1","width":2000}]},"2":{"title":"File:Kopi B.jpg","index":3,"imageinfo":[{"thumburl":"t2","descriptionurl":"p2","width":2000}]},"3":{"title":"File:Kopi A.JPG","index":2,"imageinfo":[{"thumburl":"t3","descriptionurl":"p3","width":1600}]},"4":{"title":"File:Small.jpg","index":4,"imageinfo":[{"thumburl":"t4","descriptionurl":"p4","width":300}]}}}}"#;let c=commons_candidates(j);assert_eq!(c.len(),2);assert_eq!(c[0].2,"File:Kopi A.JPG");assert_eq!(c[1].0,"t2");assert!(commons_candidates("nope").is_empty());}
+#[test]fn tool_is_declared_and_dispatched(){let src=include_str!("tools.rs");assert!(src.contains("\"search_commons\" => search_commons"));assert!(src.contains("KREDIT TERVERIFIKASI"));}}
