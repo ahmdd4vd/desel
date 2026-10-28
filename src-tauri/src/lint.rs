@@ -847,11 +847,22 @@ pub fn photo_layout(html:&str)->Option<String>{
     None
 }
 #[test]#[ignore]fn photo_layout_dirs(){for d in std::env::var("DECK_DIRS").unwrap_or_default().split(',').filter(|x|!x.is_empty()){let mut sigs=vec![];for i in 0..12{if let Ok(h)=std::fs::read_to_string(format!("{d}/{i}.html")){sigs.push(photo_layout(&h).unwrap_or("-".into()))}}println!("[sig] {d}: {}",sigs.join(" "));}}
+#[test]fn dark_background_detected(){assert_eq!(dark_background("<style>body{background:#0D0B09}</style>"),Some(true));assert_eq!(dark_background("<style>.stage{position:absolute;background:#f3ece0}</style>"),Some(false));assert_eq!(dark_background("<body></body>"),None);}
+#[test]fn tone_monotone_fires_on_fourth_dark(){let mk=|bg:&str|serde_json::json!({"id":bg,"html":format!("<style>body{{background:{bg}}}</style><body>x</body>")});let d:crate::model::Deck=serde_json::from_value(serde_json::json!({"id":"d","aspect":"4:5","slides":[mk("#0d0b09"),mk("#0d0b09"),mk("#111"),mk("#0d0b09"),mk("#f3ece0")]})).unwrap();assert!(!deck_lint(&d,2).iter().any(|i|i.rule=="tone-monotone"));assert!(deck_lint(&d,3).iter().any(|i|i.rule=="tone-monotone"));assert!(!deck_lint(&d,4).iter().any(|i|i.rule=="tone-monotone"));}
 #[test]fn photo_layout_signatures(){let big="a".repeat(2500);
  let full=format!("<style>.p{{position:absolute;inset:0}}</style><body><div class=p><img src=\"data:image/jpeg;base64,{big}\"></div></body>");assert_eq!(photo_layout(&full).as_deref(),Some("full"));
  let band=format!("<style>.p{{position:absolute;left:0;top:0;width:1080px;height:640px}}</style><body><div class=p><img src=\"data:image/jpeg;base64,{big}\"></div></body>");assert_eq!(photo_layout(&band).as_deref(),Some("band-top"));
  let col=format!("<style>.p{{position:absolute;right:0;top:0;width:480px;height:1350px}}</style><body><div class=p><img src=\"data:image/jpeg;base64,{big}\"></div></body>");assert_eq!(photo_layout(&col).as_deref(),Some("col-right"));
  assert_eq!(photo_layout("<body>none</body>"),None);}
+
+/// True when the slide's base background colour is dark (first hex colour on html/body/.stage/.slide/.canvas/.frame).
+pub fn dark_background(html:&str)->Option<bool>{
+    let re=regex::Regex::new(r"(?s)(?:html|body|\.stage|\.slide|\.canvas|\.frame)[^{}]*\{[^}]*?background(?:-color)?:\s*#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b").ok()?;
+    let h=re.captures(html)?.get(1)?.as_str().to_string();
+    let h=if h.len()==3{h.chars().flat_map(|c|[c,c]).collect::<String>()}else{h};
+    let v=|i:usize|u8::from_str_radix(&h[i..i+2],16).unwrap_or(0) as f64/255.0;
+    Some(0.2126*v(0)+0.7152*v(2)+0.0722*v(4)<0.25)
+}
 
 /// Photo/credit rules that need the whole deck. Rebuilt in run 125b after a workspace loss.
 pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
@@ -863,6 +874,8 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
         let vis:Vec<&crate::model::Slide>=deck.slides.iter().take(index+1).filter(|s|!s.hidden).collect();
         if vis.len()>=3{let n=vis.len();if (n-3..n-1).all(|i|photo_layout(&vis[i].html).as_deref()==Some(sig.as_str())){out.push(error("layout-monotone",format!("3 slide berturut-turut memakai penempatan foto yang sama ({sig}). Ubah slide ini: pilih salah satu: (a) foto penuh kanvas + panel teks gelap di bawah, (b) kolom foto 45% tinggi penuh di kiri/kanan, (c) band foto atas 55% (bila yang lain bukan band), (d) foto inset miring 60% lebar di atas latar krem, (e) foto potong diagonal clip-path. Jangan ulangi struktur slide sebelumnya.")))}}
     }
+    {let vis:Vec<&crate::model::Slide>=deck.slides.iter().take(index+1).filter(|s|!s.hidden).collect();
+     if vis.len()>=4&&vis.len()==deck.slides.iter().take(index+1).filter(|s|!s.hidden).count(){let n=vis.len();if vis[n-4..].iter().all(|s|dark_background(&s.html)==Some(true)){out.push(error("tone-monotone",format!("4 slide berturut-turut berlatar gelap. Slide ini harus berlatar TERANG (krem/putih, mis. #F3ECE0) dengan teks gelap dan foto sebagai band/inset atau kolom, supaya ritme terang-gelap berganti.")))}}}
     if let Some((kk,n))=page_marker(&slide.html){let total=deck.slides.iter().filter(|s|!s.hidden).count();if n==total&&kk!=index+1{out.push(error("slide-order",format!("Penanda halaman \"{kk}/{n}\" tidak sama dengan posisi slide ({}/{total}). Urutan slide salah: tulis ulang slide dengan index yang benar atau perbaiki nomornya.",index+1)))}}
     // repeated photo: identical asset id or identical data-URI body on another slide
     let keys=|html:&str|->std::collections::HashSet<String>{
