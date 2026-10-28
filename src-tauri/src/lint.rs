@@ -876,6 +876,7 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     }
     {let vis:Vec<&crate::model::Slide>=deck.slides.iter().take(index+1).filter(|s|!s.hidden).collect();
      if vis.len()>=4&&vis.len()==deck.slides.iter().take(index+1).filter(|s|!s.hidden).count(){let n=vis.len();if vis[n-4..].iter().all(|s|dark_background(&s.html)==Some(true)){out.push(error("tone-monotone",format!("4 slide berturut-turut berlatar gelap. Slide ini harus berlatar TERANG (krem/putih, mis. #F3ECE0) dengan teks gelap dan foto sebagai band/inset atau kolom, supaya ritme terang-gelap berganti.")))}}}
+    if let Some((kk,n))=page_marker_padded(&slide.html){let total=deck.slides.iter().filter(|s|!s.hidden).count();if n!=total{out.push(error("page-total-mismatch",format!("Penanda halaman \"{kk:02}/{n:02}\" padahal deck berisi {total} slide. Samakan semua penomoran: tulis ulang sebagai \"{kk:02}/{total:02}\".")))}}
     if let Some((kk,n))=page_marker(&slide.html){let total=deck.slides.iter().filter(|s|!s.hidden).count();if n==total&&kk!=index+1{out.push(error("slide-order",format!("Penanda halaman \"{kk}/{n}\" tidak sama dengan posisi slide ({}/{total}). Urutan slide salah: tulis ulang slide dengan index yang benar atau perbaiki nomornya.",index+1)))}}
     // repeated photo: identical asset id or identical data-URI body on another slide
     let keys=|html:&str|->std::collections::HashSet<String>{
@@ -917,6 +918,11 @@ pub fn page_marker(html:&str)->Option<(usize,usize)>{
     let doc=scraper::Html::parse_document(html);let text:String=doc.root_element().text().collect::<Vec<_>>().join(" ");
     let re=regex::Regex::new(r"(?:^|\D)(\d{1,2})\s*/\s*(\d{1,2})(?:\D|$)").ok()?;
     for c in re.captures_iter(&text){let a:usize=c[1].parse().ok()?;let b:usize=c[2].parse().ok()?;if a>=1&&a<=b&&b>=2&&b<=30{return Some((a,b))}}None
+}
+pub fn page_marker_padded(html:&str)->Option<(usize,usize)>{
+    let doc=scraper::Html::parse_document(html);let text:String=doc.root_element().text().collect::<Vec<_>>().join(" ");
+    let re=regex::Regex::new(r"(?:^|\D)(\d{2})\s*/\s*(\d{2})(?:\D|$)").ok()?;
+    for c in re.captures_iter(&text){let a:usize=c[1].parse().ok()?;let b:usize=c[2].parse().ok()?;if a>=1&&a<=b&&b>=3&&b<=12{return Some((a,b))}}None
 }
 #[test]fn page_marker_and_order(){assert_eq!(page_marker("<body><div>05 / 06</div></body>"),Some((5,6)));assert_eq!(page_marker("<body>3/4 cup</body>"),Some((3,4)));assert_eq!(page_marker("<body>no</body>"),None);}
 
@@ -965,6 +971,7 @@ pub fn fix_credit_size(html:&str)->String{
 #[cfg(test)]
 mod deck_lint_tests{use super::*;
 fn deck(htmls:&[&str])->crate::model::Deck{let sl:Vec<serde_json::Value>=htmls.iter().enumerate().map(|(i,h)|serde_json::json!({"id":format!("s{i}"),"html":h})).collect();serde_json::from_value(serde_json::json!({"id":"d","aspect":"4:5","slides":sl})).unwrap()}
+#[test]fn page_total_mismatch(){let m=|n|format!("<body><div>{n:02} / 05</div></body>");let d=deck(&[m(1).as_str(),m(2).as_str(),m(3).as_str(),m(4).as_str(),m(5).as_str(),m(6).as_str()]);assert!(deck_lint(&d,1).iter().any(|i|i.rule=="page-total-mismatch"));let ok=|n|format!("<body><div>{n:02} / 06</div></body>");let d2=deck(&[ok(1).as_str(),ok(2).as_str(),ok(3).as_str(),ok(4).as_str(),ok(5).as_str(),ok(6).as_str()]);assert!(!deck_lint(&d2,1).iter().any(|i|i.rule=="page-total-mismatch"));let f=deck(&["<body><p>3/4 cup gula</p></body>","<body><p>x</p></body>","<body><p>x</p></body>","<body><p>x</p></body>","<body><p>x</p></body>","<body><p>x</p></body>"]);assert!(!deck_lint(&f,0).iter().any(|i|i.rule=="page-total-mismatch"));}
 #[test]fn repeated_photo_is_an_error(){let d=deck(&["<body><img src=\"asset:a1\"></body>","<body><img src=\"asset:a1\"></body>","<body><img src=\"asset:a2\"></body>"]);assert!(deck_lint(&d,0).iter().any(|i|i.rule=="repeated-photo"&&i.severity==Severity::Error));assert!(!deck_lint(&d,2).iter().any(|i|i.rule=="repeated-photo"));}
 #[test]fn credit_unverified_text_is_error(){let h="<body><div style=\"font-size:18px\">Foto: Wikimedia Commons, nama fotografer belum terverifikasi</div></body>";assert!(credit_issues(h).iter().any(|i|i.rule=="credit-no-name"));}
 #[test]fn credit_peta_and_lukisan_prefixes_checked(){assert!(credit_issues("<body><div style=\"font-size:18px\">Peta: Wikimedia Commons</div></body>").iter().any(|i|i.rule=="credit-no-name"));assert!(credit_issues("<body><div style=\"font-size:18px\">Lukisan: J.M.W. Turner, domain publik / Wikimedia</div></body>").iter().all(|i|i.rule!="credit-no-license"));}
