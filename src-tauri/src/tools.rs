@@ -1102,8 +1102,8 @@ async fn commons_search_json(query:&str)->Result<String,String>{
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum Verdict{Yes,No,Unsure,Unavailable}
 
-pub fn placeholder_artist(n:&str)->bool{let l=n.to_lowercase();l.trim().len()<3||["unknown","anonym","tidak diketahui","not specified","unspecified","no author","n/a","creator","wikimedia commons","wikipedia commons"].iter().any(|k|l.contains(k))}
-#[test]fn placeholder_artist_detected(){assert!(placeholder_artist("Unknown author"));assert!(placeholder_artist("AnonymousUnknown author"));assert!(placeholder_artist("Wikimedia Commons"));assert!(!placeholder_artist("Hiart"));}
+pub fn placeholder_artist(n:&str)->bool{let l=n.to_lowercase();l.trim().len()<3||["unknown","anonym","tidak diketahui","not specified","unspecified","no author","n/a","creator","wikimedia commons","wikipedia commons","credited in file","file title","see file","see description","uncredited","own work"].iter().any(|k|l.contains(k))}
+#[test]fn placeholder_artist_detected(){assert!(placeholder_artist("Unknown author"));assert!(placeholder_artist("AnonymousUnknown author"));assert!(placeholder_artist("Wikimedia Commons"));assert!(placeholder_artist("Credited in file title"));assert!(!placeholder_artist("Hiart"));}
 pub fn subject_repeat(cand_title:&str,used_pages:&[String])->bool{
     let stop=["file","jpg","jpeg","png","commons","wikimedia","indonesia","indonesian","java","javanese","with","from","street","photo","view","the","and","dari","yang"];
     let toks=|t:&str|->std::collections::HashSet<String>{t.to_lowercase().replace(|c:char|!c.is_alphanumeric()," ").split_whitespace().filter(|w|w.len()>=4&&!stop.contains(w)&&!w.chars().all(|c|c.is_ascii_digit())).map(String::from).collect()};
