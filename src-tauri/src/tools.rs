@@ -1191,7 +1191,7 @@ pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
     if let Some((la,lo))=gps{if !(la>=-11.5&&la<=6.5&&lo>=94.5&&lo<=141.5){return true}}
     FOREIGN_WORDS.iter().any(|w|has_word(meta,w)&&!has_word(brief,w))
 }
-pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","peta","grafik","bagan","perangko","prangko","stamp","stempel","text","letter"].iter().any(|w|has_word(title,w))}
+pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","peta","grafik","bagan","perangko","prangko","stamp","stempel","text","letter","informasi","infografis","infographic","skema"].iter().any(|w|has_word(title,w))}
 #[test]fn geo_city_briefs_reject_foreign(){assert!(foreign_for_brief("pempek Palembang","Scomberomorus commerson Philippines",None));assert!(!foreign_for_brief("pempek Palembang","Pempek Kuah Cuko",None));}
 
 #[test]fn medium_artwork_maps_lukisan(){assert_eq!(medium_from_categories("the arrest of pangeran diponegoro|pd-art (pd-old-auto-expired)|artworks with wikidata item"),"Lukisan");assert_eq!(medium_from_categories("lithographs|history"),"Litografi");assert_eq!(medium_from_categories("photographs of java"),"Foto");}
