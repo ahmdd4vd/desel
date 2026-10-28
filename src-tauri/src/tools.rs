@@ -1064,7 +1064,7 @@ async fn commons_credit(source:&str)->String{
         let tag=regex::Regex::new(r"(?s)<[^>]*>").ok()?;
         let sep=regex::Regex::new(r"</[^>]+>\s*<[^>]+>").unwrap();
         let artist2=sep.replace_all(artist,"; ");
-        let a=tag.replace_all(&artist2," ").replace("&amp;","&").split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string();
+        let a=tag.replace_all(&artist2," ").replace("&amp;","&").split_whitespace().collect::<Vec<_>>().join(" ").trim().trim_end_matches(';').trim_end_matches(',').trim().to_string();
         let a=clean_artist_name(&a);
         let lic=em.get("LicenseShortName").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_string();
         let cats=em.get("Categories").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_lowercase();
