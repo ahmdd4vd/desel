@@ -1206,6 +1206,7 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if looks_like_document(&title){eprintln!("[filter] doc-reject {title}");tried.push(format!("{title}: dokumen/scan, bukan foto subjek"));continue}
         let (meta,gps)=commons_meta(&page).await;
         if foreign_for_brief(&brief,&format!("{title} {meta}"),gps){eprintln!("[filter] geo-reject {title}");tried.push(format!("{title}: lokasi di luar daerah brief"));continue}
+        if packaged_product(&meta,&role,&msg){eprintln!("[filter] product-reject-meta {title}");tried.push(format!("{title}: deskripsi menyebut kemasan/botol/merek, bukan bahan/hidangan asli"));continue}
         let jmeta=format!("{title}. {meta}");
         if judge_photo_relevance(&ctx.settings,&role,&format!("{msg} [Brief carousel: {}]",brief.chars().take(200).collect::<String>()),&jmeta).await==Verdict::No{eprintln!("[filter] judge-reject {title}");tried.push(format!("{title}: ditolak juri subjek"));continue}
         let a=json!({"url":thumb,"sourceUrl":page,"role":role,"slideMessage":msg,"rightsNote":"Wikimedia Commons, lisensi bebas; fotografer dari halaman file"});
