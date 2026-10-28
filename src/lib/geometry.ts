@@ -1,5 +1,5 @@
 import type { LintIssue } from './types';
-export const geometryRules=new Set(['overlap','text-image-overlap','text-overflow','text-hidden-by-photo']);
+export const geometryRules=new Set(['overlap','text-image-overlap','text-overflow','text-hidden-by-photo','credit-clipped']);
 /** Rendered text glyph lines, not container boxes. Findings require review,
  * not an assertion that every overlap is wrong. data-overlap="intentional"
  * explicitly exempts an authored layering group, never inferred from a class. */
@@ -12,6 +12,7 @@ export function measureOverlapIssues(doc:Document):LintIssue[]{
  const canvas=doc.body.getBoundingClientRect();const snip=(s:string)=>s.slice(0,38);const seen=new Set<string>();
  const add=(rule:string,message:string,severity:'warn'|'error'='warn')=>{const key=rule+message;if(!seen.has(key)){seen.add(key);issues.push({rule,severity,message})}};
  const intersect=(a:DOMRect,b:DOMRect)=>Math.max(0,Math.min(a.right,b.right)-Math.max(a.left,b.left))*Math.max(0,Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top));
+ for(const r of runs){if(/^foto:/i.test(r.text)){const m=24;if(r.rect.left<canvas.left+m-1||r.rect.right>canvas.right-m+1||r.rect.bottom>canvas.bottom-m+1||r.rect.top<canvas.top+m-1||runs.filter(x=>x.el===r.el).length>1)add('credit-clipped',`Kredit "${snip(r.text)}" terpotong/terlalu dekat tepi atau membungkus >1 baris. Beri margin >=24px dari tepi kanvas, satu baris (white-space:nowrap).`,'error')}}
  for(let i=0;i<runs.length;i++){const a=runs[i];if(a.rect.left<canvas.left-2||a.rect.right>canvas.right+2||a.rect.top<canvas.top-2||a.rect.bottom>canvas.bottom+2)add('text-overflow',`Teks keluar kanvas: "${snip(a.text)}". Periksa crop yang disengaja.`);
  for(let j=i+1;j<runs.length;j++){const b=runs[j];if(a.el===b.el||a.el.contains(b.el)||b.el.contains(a.el))continue;const min=Math.min(a.rect.width*a.rect.height,b.rect.width*b.rect.height);if(min>0&&intersect(a.rect,b.rect)/min>.2)add('overlap',`Baris teks bertumpuk: "${snip(a.text)}" dan "${snip(b.text)}". Periksa keterbacaan.`);}
  for(const image of Array.from(doc.images)){if(skip(image)||image.parentElement?.closest('[data-overlap="intentional"]'))continue;const rect=image.getBoundingClientRect();if(rect.width>canvas.width*.9&&rect.height>canvas.height*.85)continue; // full-bleed backdrop, not product panel
