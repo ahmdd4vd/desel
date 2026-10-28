@@ -767,6 +767,24 @@ fn apply_patch(source: &str, op: &str, selector: &str, fragment: &str, text: &st
     use scraper::node::{Node, Text};
     use scraper::{ElementRef, Html, Selector};
 
+fn frag_children_unwrapped<'a>(frag: &'a Html) -> Vec<NodeRef<'a, Node>> {
+    let mut out: Vec<NodeRef<'a, Node>> = Vec::new();
+    let mut stack: Vec<NodeRef<'a, Node>> = frag.tree.root().children().collect();
+    while let Some(n) = stack.pop() {
+        if let Node::Element(el) = n.value() {
+            let tag = el.name();
+            if tag == "html" || tag == "head" || tag == "body" {
+                let kids: Vec<NodeRef<'a, Node>> = n.children().collect();
+                for k in kids.into_iter().rev() { stack.push(k); }
+                continue;
+            }
+        }
+        out.push(n);
+    }
+    out.reverse();
+    out
+}
+
     fn find_id(tree: &Tree<Node>, selector: &str) -> Result<NodeId, String> {
         let sel = Selector::parse(selector).map_err(|_| format!("selector CSS tidak valid: `{selector}`"))?;
         for node in tree.root().descendants() {
@@ -814,7 +832,7 @@ fn apply_patch(source: &str, op: &str, selector: &str, fragment: &str, text: &st
             }
             let id = find_id(&doc.tree, selector)?;
             let frag = Html::parse_fragment(fragment);
-            let frag_children: Vec<NodeRef<'_, Node>> = frag.tree.root().children().collect();
+            let frag_children: Vec<NodeRef<'_, Node>> = frag_children_unwrapped(&frag);
             let mut target = doc.tree.get_mut(id).ok_or("node hilang")?;
             for child in &frag_children {
                 let mut inserted = target.insert_before(child.value().clone());
@@ -829,7 +847,7 @@ fn apply_patch(source: &str, op: &str, selector: &str, fragment: &str, text: &st
             let sel = if selector.trim().is_empty() { "body" } else { selector };
             let id = find_id(&doc.tree, sel)?;
             let frag = Html::parse_fragment(fragment);
-            let frag_children: Vec<NodeRef<'_, Node>> = frag.tree.root().children().collect();
+            let frag_children: Vec<NodeRef<'_, Node>> = frag_children_unwrapped(&frag);
             let mut target = doc.tree.get_mut(id).ok_or("node hilang")?;
             for child in &frag_children {
                 let mut appended = target.append(child.value().clone());

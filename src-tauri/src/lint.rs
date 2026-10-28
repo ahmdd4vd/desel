@@ -906,6 +906,30 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     if visible>=5&&with_img*2<visible&&index>0&&index+1<deck.slides.len()&&!slide.html.to_ascii_lowercase().contains("<img"){
         out.push(warn("photo-sparse",format!("Hanya {with_img} dari {visible} slide yang berfoto; slide {} tanpa foto. Bila brief meminta carousel image-led atau foto per slide, panggil search_commons (kata kunci 2 kata sesuai subjek slide) lalu pasang <img> foto >=45% kanvas dengan kredit. Ilustrasi SVG bukan foto.",index+1)))
     }
+    // double-html: model emitted a second document fragment inside the slide
+    {let lc=slide.html.to_lowercase();
+     if lc.matches("<html").count()>1||lc.matches("<body").count()>1{
+        out.push(error("double-html","Slide ini mengandung tag <html>/<body> kedua di dalam dokumen (fragmen dokumen ganda). Sisa fragmen seperti ini merender CSS/teks mentah di atas slide. Tulis ulang slide sebagai SATU dokumen utuh: satu <html>, satu <head> berisi semua <style>, satu <body>."))}
+    }
+    // title-count-mismatch: headline "N cara/hal/..." vs jumlah item berulang
+    {let doc=scraper::Html::parse_document(&slide.html);
+     let sel=scraper::Selector::parse("h1,h2").unwrap();
+     if let Some(h)=doc.select(&sel).next(){
+        let text=h.text().collect::<Vec<_>>().join(" ").to_lowercase();
+        let re=regex::Regex::new(r"\b(dua|tiga|empat|lima|enam|tujuh|delapan|[2-8])\s+(cara|langkah|hal|alasan|jenis|metode|tahap|fase|babak|prinsip|pilar|tips|rahasia|bagian|lapisan|kata)\b").unwrap();
+        if let Some(c)=re.captures(&text){
+            let n:usize=match&c[1]{"dua"=>2,"tiga"=>3,"empat"=>4,"lima"=>5,"enam"=>6,"tujuh"=>7,"delapan"=>8,x=>x.parse().unwrap_or(0)};
+            let cre=regex::Regex::new(r#"class="([a-z0-9_-]+)"#).unwrap();
+            const EXCL:&[&str]=&["paper","grain","head","foot","rule","eyebrow","credit","scrim","fscrim","figure","stage","bg","overlay","kicker","page","num","idx","noise","vign","glow","top","bar","creditbar","label","name","desc","txt","title","sub","cap","tag","note"];
+            let lc2=slide.html.to_lowercase();
+            let mut cnt:std::collections::HashMap<String,usize>=std::collections::HashMap::new();
+            for m in cre.captures_iter(&lc2){let k=m[1].to_string();if !EXCL.contains(&k.as_str()){*cnt.entry(k).or_default()+=1}}
+            if let Some((top,mx))=cnt.iter().max_by_key(|(_,v)|*v){if *mx>=2&&*mx!=n{
+                out.push(warn("title-count-mismatch",format!("Judul menyebut \"{}\" (n={}) tetapi struktur daftar di slide punya {} item berulang (.{top}). Samakan: ubah angka di judul atau jumlah itemnya; jangan biarkan pembaca menghitung sendiri dan menemukan selisih.",&c[0],n,mx)))}
+            }
+        }
+     }
+    }
     out
 }
 
@@ -992,3 +1016,4 @@ fn deck(htmls:&[&str])->crate::model::Deck{let sl:Vec<serde_json::Value>=htmls.i
 #[test]fn credit_without_license_is_error(){assert!(credit_issues("<body><div style=\"font-size:18px\">Foto: Gunawan Kartapranata / Wikimedia</div></body>").iter().any(|i|i.rule=="credit-no-license"));assert!(credit_issues("<body><div style=\"font-size:18px\">Foto: Gunawan / Wikimedia (Public domain)</div></body>").is_empty());}
 #[test]fn credit_rules(){let bad="<body><div style=\"font-size:12px\">Foto: Unknown author / Wikimedia</div><div>Foto: A / Wikimedia Foto: A / Wikimedia</div></body>";let r:Vec<String>=credit_issues(bad).into_iter().map(|i|i.rule).collect();assert!(r.contains(&"credit-tiny".to_string()));assert!(r.contains(&"credit-no-name".to_string()));assert!(r.contains(&"credit-duplicated-text".to_string()));assert!(credit_issues("<body><div style=\"font-size:18px\">Foto: Adilarmaya / Wikimedia (CC BY-SA 4.0)</div></body>").is_empty());}
 #[test]fn photo_sparse_warns_on_photoless_middle_slides(){let p="<body><img src=\"asset:x\"></body>";let n="<body><p>x</p></body>";let d=deck(&[p,n,n,n,n,n,n]);assert!(deck_lint(&d,3).iter().any(|i|i.rule=="photo-sparse"));assert!(!deck_lint(&d,0).iter().any(|i|i.rule=="photo-sparse"));assert!(!deck_lint(&d,6).iter().any(|i|i.rule=="photo-sparse"));}}
+
