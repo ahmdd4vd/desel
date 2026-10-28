@@ -501,6 +501,18 @@ pub async fn run_agent(
 ) {
     run_agent_scoped(db,settings,deck_id,history,geometry,cancel,channel,None).await;
 }
+pub const COMMONS_SPIRAL_CAP:usize=14;
+fn commons_spiral(total_calls:usize,saved_slides:usize)->bool{saved_slides==0&&total_calls>COMMONS_SPIRAL_CAP}
+/// True only when the user's brief explicitly asks for photos (not a generic "carousel").
+pub fn brief_requires_photos(brief:&str)->bool{let b=brief.to_lowercase();b.contains("foto")&&["% kanvas","image-led","foto per slide","foto tiap","foto setiap","foto besar","foto yang memperlihatkan","foto minimal"].iter().any(|k|b.contains(k))}
+/// Visible slides after the cover (the last one is exempt as a closing slide) with no <img>.
+pub fn photoless_slides(deck:&Deck)->Vec<usize>{let vis:Vec<usize>=deck.slides.iter().enumerate().filter(|(_,s)|!s.hidden).map(|(i,_)|i).collect();if vis.len()<4{return vec![]}let last=*vis.last().unwrap();vis.into_iter().filter(|i|*i!=last&&!deck.slides[*i].html.to_ascii_lowercase().contains("<img")).collect()}
+/// Largest-looking title of a slide: first h1/h2, else first text node of 2-60 chars.
+pub fn slide_title(html:&str)->String{let doc=scraper::Html::parse_document(html);for sel in ["h1","h2",".title","div"]{if let Ok(s)=scraper::Selector::parse(sel){for e in doc.select(&s){let t=e.text().collect::<Vec<_>>().join(" ");let t=t.split_whitespace().collect::<Vec<_>>().join(" ");if t.chars().count()>=2&&t.chars().count()<=60{return t}}}}String::new()}
+#[cfg(test)]mod photo_gate_tests{use super::*;
+#[test]fn spiral_logic(){assert!(commons_spiral(15,0));assert!(!commons_spiral(14,0));assert!(!commons_spiral(30,3));}
+#[test]fn gate_logic(){assert!(brief_requires_photos("foto minimal 45% kanvas"));assert!(!brief_requires_photos("Buat carousel 6 slide tentang tool"));let d:Deck=serde_json::from_value(json!({"id":"d","aspect":"4:5","slides":[{"id":"a","html":"<body><img src=\"x\"></body>"},{"id":"b","html":"<body><svg></svg></body>"},{"id":"c","html":"<body><svg></svg></body>"},{"id":"e","html":"<body>x</body>"}]})).unwrap();assert_eq!(photoless_slides(&d),vec![1,2]);}
+#[test]fn slide_title_prefers_heading(){assert_eq!(slide_title("<body><div>02 / 07</div><h1>Toraja</h1></body>"),"Toraja");assert_eq!(slide_title("<body></body>"),"");}}
 pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:Vec<ChatMessage>,geometry:Vec<String>,cancel:std::sync::Arc<std::sync::atomic::AtomicBool>,channel:Channel<AgentEvent>,context:Option<crate::creator::CreatorRequest>){
     let provider = provider_label(&settings.base_url);
     let url = endpoint(&settings.base_url, "chat/completions");
@@ -562,6 +574,8 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
         wire.insert(1, json!({ "role": "system", "content": block }));
     }
 
+    let design_brief:String=history.iter().find(|m|m.role=="user").map(|m|m.content.clone()).unwrap_or_default();
+    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;
     let max_turns = settings.max_turns.clamp(1, 64);
     let mut reviewed:std::collections::HashMap<String,(String,bool)>=std::collections::HashMap::new();
     let mut isolation_failed=false;
@@ -735,6 +749,14 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
 
         // ---- no tools: this is the final answer ----
         if calls.is_empty() {
+            if photo_nudges<3&&turn<max_turns&&brief_requires_photos(&design_brief){
+                if let Some(d)=db.get_deck(deck_id){let missing=photoless_slides(&d);if !missing.is_empty(){
+                    photo_nudges+=1;
+                    wire.push(json!({"role":"assistant","content":text_buf.clone()}));
+                    wire.push(json!({"role":"system","content":format!("Brief meminta foto, tetapi slide {} belum punya foto nyata (ilustrasi SVG atau CSS bukan foto). Untuk tiap slide itu panggil search_commons berturut-turut tanpa patch di antaranya (kata kunci 2 kata: judul slide + jenis objek), lalu patch_slide: hapus ilustrasinya dan pasang <img> foto >=45% kanvas dengan kredit. Judul slide: {}. Bagian {} dari 3.",missing.iter().map(|i|(i+1).to_string()).collect::<Vec<_>>().join(", "),missing.iter().map(|i|format!("slide {} \"{}\"",i+1,slide_title(&d.slides[*i].html))).collect::<Vec<_>>().join("; "),photo_nudges)}));
+                    continue;
+                }}
+            }
             let msg = ChatMessage {
                 id: new_id("msg"),
                 deck_id: deck_id.to_string(),
@@ -848,7 +870,7 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
                     }
                 }
                 tools::ToolOutcome{content,deck:None,pause_question:None}
-            }else{tools::execute(&ctx, &record.name, &parsed).await};
+            }else if record.name=="search_commons"&&{run_commons+=1;commons_spiral(hist_commons+run_commons,db.get_deck(deck_id).map(|d|d.slides.len()).unwrap_or(0))}{tools::ToolOutcome{content:"error: PENCARIAN FOTO DITUTUP. Sudah terlalu banyak search_commons tanpa satu slide pun tersimpan. Tulis SEMUA slide sekarang dengan write_slide memakai aset yang sudah diimpor.".into(),deck:None,pause_question:None}}else{tools::execute(&ctx, &record.name, &parsed).await};
 
             if let Some(run)=context.as_ref().and_then(|c|c.run_id.as_ref()){
               let state=if outcome.content.starts_with("error:"){"error"}else{"finished"};
