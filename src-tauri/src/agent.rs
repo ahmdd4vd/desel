@@ -2287,6 +2287,30 @@ mod live_provider_tests_2 {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Live photo-brief session; topic from LIVE_BRIEF env. Writes slides to /tmp/live-out.
+    #[tokio::test]
+    #[ignore]
+    async fn live_photo_brief() {
+        let Some(settings) = live_settings() else { return; };
+        let brief = std::env::var("LIVE_BRIEF").unwrap_or_default();
+        let path = std::env::temp_dir().join(format!("desel-live-{}.db", uuid::Uuid::new_v4().simple()));
+        let db = crate::db::Db::open(path.clone()).expect("db");
+        let msg = ChatMessage { id: new_id("msg"), deck_id: "live_deck".into(), role: "user".into(), content: brief, tool_calls: Vec::new(), tool_call_id: None, reasoning_content: String::new(), streaming: false, created_at: chrono::Utc::now().to_rfc3339() };
+        let _ = db.append_message(&msg);
+        let (channel, seen) = collector();
+        run_agent(&db, &settings, "live_deck", vec![msg], Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel).await;
+        dump("live-photo", &db, &seen);
+        let deck = db.get_deck("live_deck").expect("deck");
+        let (w, h) = crate::lint::canvas(&deck.aspect);
+        std::fs::create_dir_all("/tmp/live-out").ok();
+        for (i, s) in deck.slides.iter().enumerate() {
+            std::fs::write(format!("/tmp/live-out/{i}.html"), &s.html).ok();
+            let iss = crate::lint::lint(&s.html, w, h);
+            println!("[live] slide {i} \"{}\" lint: {}", s.title, crate::lint::summarise(&iss).replace('\n', " | "));
+        }
+        println!("[live] slides={}", deck.slides.len());
+    }
+
     /// TEST-ONLY regression for M-1/M-2: an explicit slide count + structure is
     /// a contract, and narration follows the user's language.
     #[tokio::test]
