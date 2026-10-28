@@ -810,12 +810,59 @@ mod tests {
 
 #[cfg(test)]mod landscape_tests{#[test]fn landscape_canvas_is_not_portrait_fallback(){assert_eq!(super::canvas("16:9"),(1920.0,1080.0));}}
 
+
+/// Coarse photo-placement signature of a slide ("full", "band-top", "col-right", "inset", ...), None when no photo or unknown.
+pub fn photo_layout(html:&str)->Option<String>{
+    let doc=scraper::Html::parse_document(html);
+    let img_sel=scraper::Selector::parse("img").ok()?;
+    let img=doc.select(&img_sel).max_by_key(|e|e.value().attr("src").map_or(0,|s|s.len()))?;
+    if img.value().attr("src").map_or(true,|s|s.len()<2000&&!s.starts_with("asset:")){return None}
+    // css blocks by class
+    let mut rules:Vec<(String,String)>=vec![];
+    let mut rest=html;
+    while let Some(i)=rest.find('{'){let Some(j)=rest[i..].find('}')else{break};let sel=rest[..i].rsplit(['}','>']).next().unwrap_or("").trim().to_string();rules.push((sel,rest[i+1..i+j].to_string()));rest=&rest[i+j+1..];}
+    let mut props=String::new();
+    // element chain: img + up to 2 ancestors
+    let mut chain:Vec<scraper::ElementRef>=vec![img];
+    let mut cur=img.parent().and_then(scraper::ElementRef::wrap);
+    for _ in 0..2{if let Some(p)=cur{if p.value().name()!="body"{chain.push(p)}cur=p.parent().and_then(scraper::ElementRef::wrap)}}
+    for e in &chain{
+        if let Some(st)=e.value().attr("style"){props.push_str(st);props.push(';')}
+        for c in e.value().classes(){for (sel,body) in &rules{if sel.split(',').any(|s|{let s=s.trim();s==format!(".{c}")||s.ends_with(&format!(" .{c}"))}){props.push_str(body);props.push(';')}}}
+    }
+    let get=|name:&str|->Option<f32>{
+        let (mut px,mut pc)=(None,None);
+        for decl in props.split(';'){let d=decl.trim();if let Some((k,v))=d.split_once(':'){if k.trim()==name{let v=v.trim();let n:String=v.chars().take_while(|c|c.is_ascii_digit()||*c=='.'||*c=='-').collect();if let Ok(x)=n.parse::<f32>(){if v[n.len()..].starts_with('%'){if pc.is_none(){pc=Some(x*10.8)}}else if (v[n.len()..].starts_with("px")||x==0.0)&&px.is_none(){px=Some(x)}}}}}
+        px.or(pc)
+    };
+    if props.contains("inset:0")||props.contains("inset: 0"){return Some("full".into())}
+    let (w,h)=(get("width"),get("height"));
+    let wf=w.map_or(false,|x|x>=970.0);let hf=h.map_or(false,|x|x>=1215.0);
+    let has0=|n:&str|get(n).map_or(false,|x|x.abs()<1.0);
+    let (l0,r0,t0,b0)=(has0("left"),has0("right"),has0("top"),has0("bottom"));
+    if wf&&hf{return Some("full".into())}
+    if wf{return Some(if b0&&!t0{"band-bottom".into()}else{"band-top".into()})}
+    if hf{return Some(if r0&&!l0{"col-right".into()}else{"col-left".into()})}
+    if w.is_some()||h.is_some()||props.contains("position"){return Some("inset".into())}
+    None
+}
+#[test]#[ignore]fn photo_layout_dirs(){for d in std::env::var("DECK_DIRS").unwrap_or_default().split(',').filter(|x|!x.is_empty()){let mut sigs=vec![];for i in 0..12{if let Ok(h)=std::fs::read_to_string(format!("{d}/{i}.html")){sigs.push(photo_layout(&h).unwrap_or("-".into()))}}println!("[sig] {d}: {}",sigs.join(" "));}}
+#[test]fn photo_layout_signatures(){let big="a".repeat(2500);
+ let full=format!("<style>.p{{position:absolute;inset:0}}</style><body><div class=p><img src=\"data:image/jpeg;base64,{big}\"></div></body>");assert_eq!(photo_layout(&full).as_deref(),Some("full"));
+ let band=format!("<style>.p{{position:absolute;left:0;top:0;width:1080px;height:640px}}</style><body><div class=p><img src=\"data:image/jpeg;base64,{big}\"></div></body>");assert_eq!(photo_layout(&band).as_deref(),Some("band-top"));
+ let col=format!("<style>.p{{position:absolute;right:0;top:0;width:480px;height:1350px}}</style><body><div class=p><img src=\"data:image/jpeg;base64,{big}\"></div></body>");assert_eq!(photo_layout(&col).as_deref(),Some("col-right"));
+ assert_eq!(photo_layout("<body>none</body>"),None);}
+
 /// Photo/credit rules that need the whole deck. Rebuilt in run 125b after a workspace loss.
 pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     let mut out=vec![];
     let Some(slide)=deck.slides.get(index) else{return out};
     out.extend(credit_issues(&slide.html));
     out.extend(divider_issues(&slide.html));
+    if let Some(sig)=photo_layout(&slide.html){
+        let vis:Vec<&crate::model::Slide>=deck.slides.iter().take(index+1).filter(|s|!s.hidden).collect();
+        if vis.len()>=3{let n=vis.len();if (n-3..n-1).all(|i|photo_layout(&vis[i].html).as_deref()==Some(sig.as_str())){out.push(error("layout-monotone",format!("3 slide berturut-turut memakai penempatan foto yang sama ({sig}). Ubah slide ini: pilih salah satu: (a) foto penuh kanvas + panel teks gelap di bawah, (b) kolom foto 45% tinggi penuh di kiri/kanan, (c) band foto atas 55% (bila yang lain bukan band), (d) foto inset miring 60% lebar di atas latar krem, (e) foto potong diagonal clip-path. Jangan ulangi struktur slide sebelumnya.")))}}
+    }
     if let Some((kk,n))=page_marker(&slide.html){let total=deck.slides.iter().filter(|s|!s.hidden).count();if n==total&&kk!=index+1{out.push(error("slide-order",format!("Penanda halaman \"{kk}/{n}\" tidak sama dengan posisi slide ({}/{total}). Urutan slide salah: tulis ulang slide dengan index yang benar atau perbaiki nomornya.",index+1)))}}
     // repeated photo: identical asset id or identical data-URI body on another slide
     let keys=|html:&str|->std::collections::HashSet<String>{
