@@ -2383,6 +2383,17 @@ mod live_provider_tests_2 {
             run_agent(&db, &settings, "live_deck", hist, lines, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel2).await;
             let _=seen2;
         }
+        // Post-geometry count check: geometry fixes can add slides (Gojek 7/6), and the
+        // trim continuation above only runs before the geometry rounds.
+        for attempt in 1..=2 {
+            let have=db.get_deck("live_deck").map(|d|d.slides.len()).unwrap_or(0);
+            if have<=want{break}
+            eprintln!("[live] deck has {have}/{want} slides after geometry; trim attempt {attempt}");
+            let content=format!("Deck sekarang berisi {have} slide, padahal brief meminta PERSIS {want} slide. Gabungkan atau hapus slide yang paling lemah sampai tersisa PERSIS {want} slide; slide yang dipertahankan jangan diubah.");
+            let m=ChatMessage{id:new_id("msg"),deck_id:"live_deck".into(),role:"user".into(),content,tool_calls:Vec::new(),tool_call_id:None,reasoning_content:String::new(),streaming:false,created_at:chrono::Utc::now().to_rfc3339()};let _=db.append_message(&m);
+            let hist=db.list_messages("live_deck");let (c3,_)=headless_channel(path.clone());
+            run_agent(&db,&settings,"live_deck",hist,Vec::new(),std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),c3).await;
+        }
         dump("live-photo", &db, &seen);
         let deck = db.get_deck("live_deck").expect("deck");
         let (w, h) = crate::lint::canvas(&deck.aspect);
