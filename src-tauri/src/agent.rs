@@ -577,7 +577,7 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
     }
 
     let design_brief:String=history.iter().find(|m|m.role=="user").map(|m|m.content.clone()).unwrap_or_default();
-    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;let mut count_nudges:u8=0;
+    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;let mut count_nudges:u8=0;let mut lint_nudges:u8=0;
     let max_turns = settings.max_turns.clamp(1, 64);
     let mut reviewed:std::collections::HashMap<String,(String,bool)>=std::collections::HashMap::new();
     let mut isolation_failed=false;
@@ -767,6 +767,17 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
                     wire.push(json!({"role":"system","content":format!("Brief meminta foto, tetapi slide {} belum punya foto nyata (ilustrasi SVG atau CSS bukan foto). Untuk tiap slide itu panggil search_commons berturut-turut tanpa patch di antaranya (kata kunci 2 kata: judul slide + jenis objek), lalu patch_slide: hapus ilustrasinya dan pasang <img> foto >=45% kanvas dengan kredit. Judul slide: {}. Bagian {} dari 3.",missing.iter().map(|i|(i+1).to_string()).collect::<Vec<_>>().join(", "),missing.iter().map(|i|format!("slide {} \"{}\"",i+1,slide_title(&d.slides[*i].html))).collect::<Vec<_>>().join("; "),photo_nudges)}));
                     continue;
                 }}
+            }
+            if lint_nudges<3&&turn<max_turns{
+                if let Some(d)=db.get_deck(deck_id){
+                    let errs:Vec<String>=(0..d.slides.len()).filter(|i|!d.slides[*i].hidden).flat_map(|i|crate::lint::deck_lint(&d,i).into_iter().filter(|x|matches!(x.severity,crate::lint::Severity::Error)).map(move|x|format!("slide {}: [{}] {}",i+1,x.rule,x.message.chars().take(220).collect::<String>())).collect::<Vec<_>>()).collect();
+                    if !errs.is_empty(){
+                        lint_nudges+=1;
+                        wire.push(json!({"role":"assistant","content":text_buf.clone()}));
+                        wire.push(json!({"role":"system","content":format!("Pemeriksaan akhir deck menemukan error yang belum diperbaiki: {}. Perbaiki sekarang dengan patch_slide/write_slide (foto lain lewat search_commons bila foto kembar), jangan berhenti sebelum errornya hilang. Bagian {} dari 3.",errs.into_iter().take(6).collect::<Vec<_>>().join(" | "),lint_nudges)}));
+                        continue;
+                    }
+                }
             }
             let msg = ChatMessage {
                 id: new_id("msg"),
@@ -2344,7 +2355,7 @@ mod live_provider_tests_2 {
         let (channel, seen) = headless_channel(path.clone());
         run_agent(&db, &settings, "live_deck", vec![msg], Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel).await;
         let want:usize=std::env::var("LIVE_N").ok().and_then(|v|v.parse().ok()).unwrap_or(6);
-        for attempt in 1..=2 {
+        for attempt in 1..=3 {
             let have=db.get_deck("live_deck").map(|d|d.slides.len()).unwrap_or(0);
             let nophoto:Vec<usize>=db.get_deck("live_deck").map(|d|photoless_slides(&d)).unwrap_or_default();
             if have>=want&&nophoto.is_empty(){break;}
