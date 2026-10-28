@@ -600,6 +600,9 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
     };
 
     for turn in 1..=max_turns {
+        if max_turns>=12&&turn==max_turns-6{if let Some(n)=requested_slide_count(&design_brief){if let Some(d)=db.get_deck(deck_id){let have=d.slides.iter().filter(|s|!s.hidden).count();if have<n{
+            wire.push(json!({"role":"system","content":format!("SISA 6 GILIRAN. Deck baru punya {have} dari {n} slide. Berhenti memperbaiki detail dan berhenti mencari foto baru. Tulis slide {} sampai {n} sekarang (penutup terakhir), pakai foto yang sudah diimpor atau tanpa foto, satu write_slide per giliran.",have+1)}));
+        }}}}
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             stopped(db, &channel);
             return;
@@ -2307,6 +2310,26 @@ mod live_provider_tests_2 {
         let _ = db.append_message(&msg);
         let (channel, seen) = collector();
         run_agent(&db, &settings, "live_deck", vec![msg], Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel).await;
+        // Geometry feedback rounds, like the app's render bridge: measure in Chrome, pass error findings back.
+        let outd0=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());
+        for round in 1..=2 {
+            let Some(deck)=db.get_deck("live_deck") else{break};
+            std::fs::create_dir_all(&outd0).ok();
+            for f in std::fs::read_dir(&outd0).into_iter().flatten().flatten(){let _=std::fs::remove_file(f.path());}
+            let titles:Vec<String>=deck.slides.iter().map(|s|s.title.clone()).collect();
+            for (i,s) in deck.slides.iter().enumerate(){std::fs::write(format!("{outd0}/{i}.html"),&s.html).ok();}
+            std::fs::write(format!("{outd0}/titles.json"),serde_json::to_string(&titles).unwrap()).ok();
+            let out=std::process::Command::new("node").arg("/home/sandbox/w/scripts/geo-measure.mjs").arg(&outd0).current_dir("/home/sandbox/w").output().ok();
+            let lines:Vec<String>=out.map(|o|String::from_utf8_lossy(&o.stdout).lines().map(|l|l.to_string()).collect()).unwrap_or_default();
+            println!("[live] geometry round {round}: {} error findings", lines.len());
+            if lines.is_empty(){break}
+            let msg2 = ChatMessage { id: new_id("msg"), deck_id: "live_deck".into(), role: "user".into(), content: "Perbaiki temuan geometri render ini pada slide yang disebut.".into(), tool_calls: Vec::new(), tool_call_id: None, reasoning_content: String::new(), streaming: false, created_at: chrono::Utc::now().to_rfc3339() };
+            let _ = db.append_message(&msg2);
+            let hist=db.list_messages("live_deck");
+            let (channel2, seen2) = collector();
+            run_agent(&db, &settings, "live_deck", hist, lines, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel2).await;
+            let _=seen2;
+        }
         dump("live-photo", &db, &seen);
         let deck = db.get_deck("live_deck").expect("deck");
         let (w, h) = crate::lint::canvas(&deck.aspect);
