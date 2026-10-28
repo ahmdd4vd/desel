@@ -240,7 +240,7 @@ fn default_temperature() -> f64 {
     0.85
 }
 fn default_max_turns() -> u32 {
-    24
+    40
 }
 fn default_true() -> bool {
     true
