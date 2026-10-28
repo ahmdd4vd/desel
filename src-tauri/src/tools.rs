@@ -1050,6 +1050,7 @@ pub fn clean_artist_name(a:&str)->String{
 }
 #[test]fn artist_boilerplate_stripped(){assert_eq!(clean_artist_name("This image was taken by the NASA Expedition 20 crew."),"NASA Expedition 20 crew");assert_eq!(clean_artist_name("Photo by Gunawan Kartapranata"),"Gunawan Kartapranata");assert_eq!(clean_artist_name("Rijksmuseum"),"Rijksmuseum");}
 
+fn medium_from_categories(cats:&str)->&'static str{if cats.contains("lithograph")||cats.contains("engraving")||cats.contains("woodcut")||cats.contains("print"){"Litografi"}else if cats.contains("artwork")||cats.contains("pd-art"){"Lukisan"}else if cats.contains("painting"){"Lukisan"}else if cats.contains("drawing")||cats.contains("sketch"){"Gambar"}else if cats.contains("map")||cats.contains("cartograph"){"Peta"}else if cats.contains("poster"){"Poster"}else if cats.contains("illustration"){"Ilustrasi"}else{"Foto"}}
 async fn commons_credit(source:&str)->String{
     let work=async{
         let t=source.split("/wiki/").nth(1)?; if !source.contains("commons.wikimedia.org"){return None;}
@@ -1068,7 +1069,7 @@ async fn commons_credit(source:&str)->String{
         let a=clean_artist_name(&a);
         let lic=em.get("LicenseShortName").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_string();
         let cats=em.get("Categories").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_lowercase();
-        let medium=if cats.contains("lithograph"){"Litografi"}else if cats.contains("engraving")||cats.contains("woodcut"){"Gravir"}else if cats.contains("painting"){"Lukisan"}else if cats.contains("drawing")||cats.contains("sketch"){"Gambar"}else if cats.contains("map")||cats.contains("cartograph"){"Peta"}else if cats.contains("poster"){"Poster"}else if cats.contains("illustration"){"Ilustrasi"}else{"Foto"};
+        let medium=medium_from_categories(&cats);
         if a.is_empty()||a.len()>80{return None;}
         Some(format!("{a}|{lic}|{medium}"))
     };
@@ -1192,6 +1193,9 @@ pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
 }
 pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","text","letter"].iter().any(|w|has_word(title,w))}
 #[test]fn geo_city_briefs_reject_foreign(){assert!(foreign_for_brief("pempek Palembang","Scomberomorus commerson Philippines",None));assert!(!foreign_for_brief("pempek Palembang","Pempek Kuah Cuko",None));}
+
+#[test]fn medium_artwork_maps_lukisan(){assert_eq!(medium_from_categories("the arrest of pangeran diponegoro|pd-art (pd-old-auto-expired)|artworks with wikidata item"),"Lukisan");assert_eq!(medium_from_categories("lithographs|history"),"Litografi");assert_eq!(medium_from_categories("photographs of java"),"Foto");}
+#[test]fn collage_word_detected(){assert!(has_word("portrait collage of the city of yogyakarta","collage"));assert!(has_word("a screenshot of the article","screenshot"));assert!(!has_word("painted portrait of the city","collage"));}
 #[test]fn geo_and_doc_filters(){assert!(foreign_for_brief("tenun ikat Sumba","Weaver, Looms in Bangladesh",None));assert!(foreign_for_brief("tenun Sumba","",Some((22.0,85.0))));assert!(!foreign_for_brief("tenun Sumba","Kain Sumba, Nusa Tenggara",Some((-9.6,119.9))));assert!(!foreign_for_brief("weaving in India","India loom",None));assert!(looks_like_document("File:Der Farbenfabrikant page 33.jpg"));assert!(looks_like_document("File:The inscription of Borobudur restoration in 1973.jpg"));assert!(!looks_like_document("Tenun ikat Sumba.jpg"));}
 
 async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
@@ -1220,6 +1224,7 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if packaged_product(&title,&role,&msg){eprintln!("[filter] product-reject {title}");tried.push(format!("{title}: foto produk kemasan/kaleng generik, cari foto bahan/hidangan aslinya"));continue}
         if looks_like_document(&title){eprintln!("[filter] doc-reject {title}");tried.push(format!("{title}: dokumen/scan, bukan foto subjek"));continue}
         let (meta,gps)=commons_meta(&page).await;
+        if looks_like_document(&meta)||has_word(&meta.to_lowercase(),"collage")||has_word(&meta.to_lowercase(),"screenshot"){eprintln!("[filter] doc-reject-meta {title}");tried.push(format!("{title}: deskripsi menyebut dokumen/kolase/screenshot, bukan foto subjek"));continue}
         if foreign_for_brief(&brief,&format!("{title} {meta}"),gps){eprintln!("[filter] geo-reject {title}");tried.push(format!("{title}: lokasi di luar daerah brief"));continue}
         if packaged_product(&meta,&role,&msg){eprintln!("[filter] product-reject-meta {title}");tried.push(format!("{title}: deskripsi menyebut kemasan/botol/merek, bukan bahan/hidangan asli"));continue}
         let jmeta=format!("{title}. {meta}");
