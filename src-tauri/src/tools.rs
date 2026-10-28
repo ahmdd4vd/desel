@@ -1104,10 +1104,11 @@ pub enum Verdict{Yes,No,Unsure,Unavailable}
 
 pub fn placeholder_artist(n:&str)->bool{let l=n.to_lowercase();l.trim().len()<3||["unknown","anonym","tidak diketahui","not specified","unspecified","no author","n/a","creator","wikimedia commons","wikipedia commons","credited in file","file title","see file","see description","uncredited","own work"].iter().any(|k|l.contains(k))}
 #[test]fn placeholder_artist_detected(){assert!(placeholder_artist("Unknown author"));assert!(placeholder_artist("AnonymousUnknown author"));assert!(placeholder_artist("Wikimedia Commons"));assert!(placeholder_artist("Credited in file title"));assert!(!placeholder_artist("Hiart"));}
-pub fn subject_repeat(cand_title:&str,used_pages:&[String])->bool{
+pub fn subject_repeat(cand_title:&str,used_pages:&[String],brief:&str)->bool{
+    let brief_l=brief.to_lowercase();
     let stop=["file","jpg","jpeg","png","commons","wikimedia","indonesia","indonesian","java","javanese","with","from","street","photo","view","the","and","dari","yang"];
     let toks=|t:&str|->std::collections::HashSet<String>{t.to_lowercase().replace(|c:char|!c.is_alphanumeric()," ").split_whitespace().filter(|w|w.len()>=4&&!stop.contains(w)&&!w.chars().all(|c|c.is_ascii_digit())).map(String::from).collect()};
-    let c=toks(cand_title);
+    let c:std::collections::HashSet<String>=toks(cand_title).into_iter().filter(|w|!brief_l.contains(w.as_str())).collect();
     used_pages.iter().any(|u|{let tail=u.rsplit('/').next().unwrap_or("");let t=toks(&tail.replace("%20"," "));c.intersection(&t).count()>=2})
 }
 
@@ -1201,7 +1202,7 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if {let c=commons_credit(&page).await;c.is_empty()||placeholder_artist(c.split('|').next().unwrap_or(""))}{tried.push(format!("{title}: fotografer tidak bernama"));continue}
         named+=1;
         if ctx.db.list_assets(&ctx.deck_id).iter().any(|a|a.provenance.as_ref().map_or(false,|p|p.source_url==page)){tried.push(format!("{title}: sudah dipakai di deck ini"));continue}
-        {let used:Vec<String>=ctx.db.list_assets(&ctx.deck_id).iter().filter_map(|a|a.provenance.as_ref().map(|p|p.source_url.clone())).collect();if subject_repeat(&title,&used){eprintln!("[filter] repeat-reject {title}");tried.push(format!("{title}: subjek mirip foto slide lain, cari subjek berbeda"));continue}}
+        {let used:Vec<String>=ctx.db.list_assets(&ctx.deck_id).iter().filter_map(|a|a.provenance.as_ref().map(|p|p.source_url.clone())).collect();if subject_repeat(&title,&used,&brief){eprintln!("[filter] repeat-reject {title}");tried.push(format!("{title}: subjek mirip foto slide lain, cari subjek berbeda"));continue}}
         if packaged_product(&title,&role,&msg){eprintln!("[filter] product-reject {title}");tried.push(format!("{title}: foto produk kemasan/kaleng generik, cari foto bahan/hidangan aslinya"));continue}
         if looks_like_document(&title){eprintln!("[filter] doc-reject {title}");tried.push(format!("{title}: dokumen/scan, bukan foto subjek"));continue}
         let (meta,gps)=commons_meta(&page).await;
@@ -1233,7 +1234,7 @@ async fn import_image(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
 #[test]fn judge_prompt_has_role_noun_rule(){assert!(judge_prompt("pewarna","","Lake in Sumba").contains("KEGIATAN/BENDA"));}
 #[test]fn judge_prompt_has_other_activity_rule(){assert!(judge_prompt("gamelan","","Blacksmith at work").contains("INDUSTRI LAIN"));}
 #[test]fn judge_prompt_has_generic_stock_rule(){assert!(judge_prompt("cangkir kopi","kopi Gayo","Coffee Pour Over Setup").contains("foto stok generik"));}
-#[test]fn subject_repeat_detects_same_subject(){let u=vec!["https://commons.wikimedia.org/wiki/File:Nangka_muda_gudeg_Wijilan.jpg".to_string()];assert!(subject_repeat("File:Nangka muda untuk gudeg.jpg",&u));assert!(!subject_repeat("File:Kuali tanah liat.jpg",&u));assert!(!subject_repeat("File:Gudeg Wijilan.jpg",&[]));}
+#[test]fn subject_repeat_detects_same_subject(){let u=vec!["https://commons.wikimedia.org/wiki/File:Nangka_muda_gudeg_Wijilan.jpg".to_string()];assert!(subject_repeat("File:Nangka muda untuk gudeg.jpg",&u,"gudeg Yogyakarta"));assert!(!subject_repeat("File:Kuali tanah liat.jpg",&u,"gudeg"));assert!(!subject_repeat("File:Gudeg Wijilan.jpg",&[],""));let t=vec!["https://commons.wikimedia.org/wiki/File:Danau_Toba_view.jpg".to_string()];assert!(!subject_repeat("File:Perahu dan danau Toba.jpg",&t,"Danau Toba dan Samosir"));}
 #[test]fn packaged_product_rejects_cans(){assert!(packaged_product("File:Coconut milk from can01.JPG","santan","Cuma dua bahan"));assert!(!packaged_product("File:Santan segar.jpg","santan",""));assert!(!packaged_product("File:Can.jpg","kaleng susu",""));}
 #[test]fn judge_prompt_has_closer_rule(){assert!(judge_prompt("warung","regenerasi","flower").contains("PENUTUP"));}
 #[test]fn judge_prompt_has_food_rule(){assert!(judge_prompt("gudeg","","Orange dish Portland").contains("MAKANAN, MASAKAN"));}
