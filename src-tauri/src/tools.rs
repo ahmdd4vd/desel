@@ -1191,10 +1191,11 @@ pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
     if let Some((la,lo))=gps{if !(la>=-11.5&&la<=6.5&&lo>=94.5&&lo<=141.5){return true}}
     FOREIGN_WORDS.iter().any(|w|has_word(meta,w)&&!has_word(brief,w))
 }
-pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","text","letter"].iter().any(|w|has_word(title,w))}
+pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","peta","grafik","bagan","text","letter"].iter().any(|w|has_word(title,w))}
 #[test]fn geo_city_briefs_reject_foreign(){assert!(foreign_for_brief("pempek Palembang","Scomberomorus commerson Philippines",None));assert!(!foreign_for_brief("pempek Palembang","Pempek Kuah Cuko",None));}
 
 #[test]fn medium_artwork_maps_lukisan(){assert_eq!(medium_from_categories("the arrest of pangeran diponegoro|pd-art (pd-old-auto-expired)|artworks with wikidata item"),"Lukisan");assert_eq!(medium_from_categories("lithographs|history"),"Litografi");assert_eq!(medium_from_categories("photographs of java"),"Foto");}
+#[test]fn map_titles_rejected(){assert!(looks_like_document("Peta Kecamatan Puncak Sorik Marapi"));assert!(looks_like_document("Peta sebaran habitat harimau"));assert!(!looks_like_document("Pemandangan hutan Sumatra pagi hari"));}
 #[test]fn collage_word_detected(){assert!(has_word("portrait collage of the city of yogyakarta","collage"));assert!(has_word("a screenshot of the article","screenshot"));assert!(!has_word("painted portrait of the city","collage"));}
 #[test]fn geo_and_doc_filters(){assert!(foreign_for_brief("tenun ikat Sumba","Weaver, Looms in Bangladesh",None));assert!(foreign_for_brief("tenun Sumba","",Some((22.0,85.0))));assert!(!foreign_for_brief("tenun Sumba","Kain Sumba, Nusa Tenggara",Some((-9.6,119.9))));assert!(!foreign_for_brief("weaving in India","India loom",None));assert!(looks_like_document("File:Der Farbenfabrikant page 33.jpg"));assert!(looks_like_document("File:The inscription of Borobudur restoration in 1973.jpg"));assert!(!looks_like_document("Tenun ikat Sumba.jpg"));}
 
