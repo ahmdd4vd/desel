@@ -1177,14 +1177,14 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if named>=4{break}
         if commons_credit(&page).await.is_empty(){tried.push(format!("{title}: fotografer tidak bernama"));continue}
         named+=1;
-        if looks_like_document(&title){tried.push(format!("{title}: dokumen/scan, bukan foto subjek"));continue}
+        if looks_like_document(&title){eprintln!("[filter] doc-reject {title}");tried.push(format!("{title}: dokumen/scan, bukan foto subjek"));continue}
         let (meta,gps)=commons_meta(&page).await;
-        if foreign_for_brief(&brief,&format!("{title} {meta}"),gps){tried.push(format!("{title}: lokasi di luar daerah brief"));continue}
+        if foreign_for_brief(&brief,&format!("{title} {meta}"),gps){eprintln!("[filter] geo-reject {title}");tried.push(format!("{title}: lokasi di luar daerah brief"));continue}
         let jmeta=format!("{title}. {meta}");
-        if judge_photo_relevance(&ctx.settings,&role,&format!("{msg} [Brief carousel: {}]",brief.chars().take(200).collect::<String>()),&jmeta).await==Verdict::No{tried.push(format!("{title}: ditolak juri subjek"));continue}
+        if judge_photo_relevance(&ctx.settings,&role,&format!("{msg} [Brief carousel: {}]",brief.chars().take(200).collect::<String>()),&jmeta).await==Verdict::No{eprintln!("[filter] judge-reject {title}");tried.push(format!("{title}: ditolak juri subjek"));continue}
         let a=json!({"url":thumb,"sourceUrl":page,"role":role,"slideMessage":msg,"rightsNote":"Wikimedia Commons, lisensi bebas; fotografer dari halaman file"});
         let out=import_image(ctx,&a).await;
-        if out.content.starts_with("Imported "){return out}
+        if out.content.starts_with("Imported "){let mut out=out;if !tried.is_empty(){out.content.push_str(&format!("\nCatatan filter (kandidat ditolak sebelum ini): {}",tried.join(" | ")));}eprintln!("[filter] diterima \"{title}\"; ditolak: {}",tried.join(" | "));return out}
         tried.push(format!("{title}: {}",out.content.lines().next().unwrap_or("").chars().take(110).collect::<String>()));
     }
     ToolOutcome{content:format!("error: tidak ada foto yang lolos untuk \"{query}\". Dicoba: {}. Pakai kata kunci lain.",tried.join(" | ")),deck:None,pause_question:None}

@@ -751,7 +751,7 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
 
         // ---- no tools: this is the final answer ----
         if calls.is_empty() {
-            if count_nudges<2&&turn<max_turns{if let Some(n)=requested_slide_count(&design_brief){if let Some(d)=db.get_deck(deck_id){let have=d.slides.iter().filter(|s|!s.hidden).count();if have>0&&have<n{
+            if count_nudges<4&&turn<max_turns{if let Some(n)=requested_slide_count(&design_brief){if let Some(d)=db.get_deck(deck_id){let have=d.slides.iter().filter(|s|!s.hidden).count();if have>0&&have<n{
                 count_nudges+=1;
                 wire.push(json!({"role":"assistant","content":text_buf.clone()}));
                 wire.push(json!({"role":"system","content":format!("Brief meminta {n} slide, deck baru punya {have}. Tulis slide {} sampai {n} sekarang (slide terakhir = penutup). Jangan berhenti sebelum {n} slide ada.",have+1)}));
