@@ -928,7 +928,7 @@ pub fn credit_issues(html:&str)->Vec<Issue>{
     for e in doc.select(&sel){
         let own:String=e.children().filter_map(|c|c.value().as_text().map(|t|t.to_string())).collect::<Vec<_>>().join(" ");
         let t=own.split_whitespace().collect::<Vec<_>>().join(" ");
-        let low0=t.to_lowercase();let prefix=["foto:","peta:","lukisan:","gambar:"].iter().find(|p|low0.starts_with(**p)).map(|p|p.to_string());if prefix.is_none(){continue}
+        let low0=t.to_lowercase();let prefix=["foto:","peta:","lukisan:","gambar:","litografi:","gravir:","ilustrasi:","poster:"].iter().find(|p|low0.starts_with(**p)).map(|p|p.to_string());if prefix.is_none(){continue}
         let low=low0.trim_start_matches(prefix.as_deref().unwrap()).trim_start().to_string();
         if low0.matches(prefix.as_deref().unwrap()).count()>=2{out.push(error("credit-duplicated-text",format!("Kredit ganda dalam satu elemen: \"{}\". Tulis satu baris kredit saja.",t.chars().take(80).collect::<String>())))}
         if prefix.as_deref().unwrap()!="foto:"{out.push(warn("credit-not-photo",format!("Kredit berawalan \"{}\" — brief image-led meminta foto nyata, bukan peta/lukisan/grafik: \"{}\". Ganti dengan foto nyata bila ada.",prefix.as_deref().unwrap(),t.chars().take(60).collect::<String>())))}
