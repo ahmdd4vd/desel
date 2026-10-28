@@ -2323,6 +2323,7 @@ mod live_provider_tests_2 {
                     let asset = Asset { provenance: None, reference_role: String::new(), reference_status: String::new(), id: new_id("review"), deck_id: Some("live_deck".into()), name: format!("__render_receipt_{rid}"), mime: "application/json".into(), data: receipt.to_string(), profile: None, created_at: chrono::Utc::now().to_rfc3339() };
                     db2.add_asset(&asset).ok();
                 }
+                if ev["type"]=="error"{eprintln!("[live] EVENT error: {}",ev["message"]);}
                 sink.lock().unwrap().push(raw.to_string());
             }
             Ok(())
@@ -2342,6 +2343,7 @@ mod live_provider_tests_2 {
         let _ = db.append_message(&msg);
         let (channel, seen) = headless_channel(path.clone());
         run_agent(&db, &settings, "live_deck", vec![msg], Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel).await;
+        if db.get_deck("live_deck").is_none(){eprintln!("[live] no deck after first run; retrying once");let hist=db.list_messages("live_deck");let (c2,_)=headless_channel(path.clone());run_agent(&db, &settings, "live_deck", hist, Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), c2).await;}
         // Geometry feedback rounds, like the app's render bridge: measure in Chrome, pass error findings back.
         let outd0=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());
         for round in 1..=2 {
