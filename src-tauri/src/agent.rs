@@ -2322,7 +2322,7 @@ mod live_provider_tests_2 {
                         .or_else(|| db2.get_deck("live_deck").and_then(|d| d.slides.get(idx).map(|s| s.html.clone()))).unwrap_or_default();
                     let f = format!("/tmp/hl-{rid}.html");
                     std::fs::write(&f, html).ok();
-                    let out = std::process::Command::new("node").arg("/home/sandbox/w/scripts/geo-measure.mjs").arg("--file").arg(&f).current_dir("/home/sandbox/w").output().ok();
+                    let out = std::process::Command::new("node").arg("/home/sandbox/w/scripts/geo-measure.mjs").arg("--file").arg(&f).arg("/tmp/g.js").arg(idx.to_string()).current_dir("/home/sandbox/w").output().ok();
                     let issues: Vec<Value> = out.and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or_default();
                     let msgs: Vec<String> = issues.iter().filter(|i| i["severity"] == "error").map(|i| format!("{}: {}", i["rule"].as_str().unwrap_or(""), i["message"].as_str().unwrap_or(""))).collect();
                     let mut receipt = json!({"revision": rev, "issues": msgs});
