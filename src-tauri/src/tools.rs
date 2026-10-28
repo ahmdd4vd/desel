@@ -1086,6 +1086,38 @@ async fn commons_search_json(query:&str)->Result<String,String>{
     Err(last)
 }
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum Verdict{Yes,No,Unsure,Unavailable}
+
+pub fn judge_prompt(role:&str,message:&str,meta:&str)->String{
+    let msg_line=if message.trim().is_empty(){String::new()}else{format!("Pesan/judul slide tempat foto dipakai: \"{message}\".\nFoto harus MENDUKUNG pesan slide itu, bukan hanya topik umum.\n")};
+    format!("Peran foto di slide: \"{role}\".\n{msg_line}Judul/deskripsi asli sumber foto (bisa bahasa Inggris): \"{meta}\".\nApakah foto itu kemungkinan besar memperlihatkan subjek yang disebut di peran? Jawab satu kata saja: YA, TIDAK, atau RAGU. TIDAK bila judul menunjukkan dokumen, teks, diploma, sertifikat, poster, tangkapan layar atau arsip, atau bila judul hanya nama orang/tempat tanpa aktivitas/objek yang diminta peran. TIDAK bila peran atau pesan slide menyebut NAMA SPESIFIK (mis. tarian Saman, rumah Tongkonan, burung Maleo, gunung Rinjani) dan judul/deskripsi foto tidak menyebut nama itu atau terjemahan/sinonimnya, hanya hal umum (mis. 'penari', 'rumah', 'burung', 'anak-anak') atau nama jenis lain (RAGU hanya bila judul memang tidak berisi nama apa pun). TIDAK bila peran atau pesan slide menyebut komoditas/objek utama (mis. kopi, burung, gunung, batik) tetapi judul foto hanya menunjukkan kota, panorama, jalan, bangunan, atau lanskap umum tanpa objek itu sebagai subjek. TIDAK bila foto dipakai di slide penutup/ringkasan/cover tetapi judul foto hanya potret/orang berpose atau wajah tanpa objek/aktivitas topik carousel. TIDAK bila judul jelas menunjukkan subjek lain (mis. bendera, pantai, orang acak untuk topik kopi). Bila bukti kurang, jawab RAGU.")
+}
+
+pub fn parse_verdict(text:&str)->Verdict{
+    let t=text.trim().to_uppercase();
+    if t.starts_with("TIDAK")||t.starts_with("NO"){Verdict::No}else if t.starts_with("YA")||t.starts_with("YES"){Verdict::Yes}else if t.starts_with("RAGU"){Verdict::Unsure}else{Verdict::Unsure}
+}
+
+async fn judge_photo_relevance(settings:&AppSettings,role:&str,message:&str,meta:&str)->Verdict{
+    if settings.api_key.trim().is_empty(){return Verdict::Unsure}
+    let base=settings.base_url.trim().trim_end_matches('/');
+    let url=if base.ends_with("/v1")||base.contains("/v1/"){format!("{base}/chat/completions")}else{format!("{base}/v1/chat/completions")};
+    let prompt=judge_prompt(role,message,meta);
+    let Ok(client)=reqwest::Client::builder().timeout(std::time::Duration::from_secs(25)).build() else{return Verdict::Unavailable};
+    for _ in 0..3{
+        let mut body=json!({"model":settings.model,"messages":[{"role":"user","content":prompt.clone()}],"max_tokens":16,"temperature":0.0});
+        if crate::capabilities::configure(&mut body,settings).is_err(){return Verdict::Unavailable}
+        let Ok(res)=client.post(&url).json(&body).bearer_auth(settings.api_key.trim()).send().await else{continue};
+        if !res.status().is_success(){continue}
+        let Ok(v)=res.json::<Value>().await else{continue};
+        let text=v["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        if text.trim().is_empty(){continue}
+        return parse_verdict(text);
+    }
+    Verdict::Unavailable
+}
+
 async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
     if !ctx.settings.enable_research{return ToolOutcome{content:"error: research disabled".into(),deck:None,pause_question:None}}
     let query=arg_str(args,"query");let role=arg_str(args,"role");let msg=arg_str(args,"slideMessage");
@@ -1106,6 +1138,7 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         if named>=4{break}
         if commons_credit(&page).await.is_empty(){tried.push(format!("{title}: fotografer tidak bernama"));continue}
         named+=1;
+        if judge_photo_relevance(&ctx.settings,&role,&msg,&title).await==Verdict::No{tried.push(format!("{title}: ditolak juri subjek"));continue}
         let a=json!({"url":thumb,"sourceUrl":page,"role":role,"slideMessage":msg,"rightsNote":"Wikimedia Commons, lisensi bebas; fotografer dari halaman file"});
         let out=import_image(ctx,&a).await;
         if out.content.starts_with("Imported "){return out}
@@ -1486,3 +1519,7 @@ pub async fn prepare_layout_candidate(ctx:&ToolContext<'_>,name:&str,args:&Value
 #[cfg(test)]mod commons_search_tests{use super::*;
 #[test]fn candidates_keep_ranked_photos_only(){let j=r#"{"query":{"pages":{"1":{"title":"File:B.svg","index":1,"imageinfo":[{"thumburl":"t1","descriptionurl":"p1","width":2000}]},"2":{"title":"File:Kopi B.jpg","index":3,"imageinfo":[{"thumburl":"t2","descriptionurl":"p2","width":2000}]},"3":{"title":"File:Kopi A.JPG","index":2,"imageinfo":[{"thumburl":"t3","descriptionurl":"p3","width":1600}]},"4":{"title":"File:Small.jpg","index":4,"imageinfo":[{"thumburl":"t4","descriptionurl":"p4","width":300}]}}}}"#;let c=commons_candidates(j);assert_eq!(c.len(),2);assert_eq!(c[0].2,"File:Kopi A.JPG");assert_eq!(c[1].0,"t2");assert!(commons_candidates("nope").is_empty());}
 #[test]fn tool_is_declared_and_dispatched(){let src=include_str!("tools.rs");assert!(src.contains("\"search_commons\" => search_commons"));assert!(src.contains("KREDIT TERVERIFIKASI"));}}
+
+#[cfg(test)]mod judge_tests{use super::*;
+#[test]fn verdict_parsing(){assert_eq!(parse_verdict("TIDAK."),Verdict::No);assert_eq!(parse_verdict(" ya"),Verdict::Yes);assert_eq!(parse_verdict("RAGU"),Verdict::Unsure);assert_eq!(parse_verdict("???"),Verdict::Unsure);}
+#[test]fn prompt_carries_named_subject_and_closer_rules(){let p=judge_prompt("body slide 2: Saman","Saman, Aceh","Children in yellow costumes.jpg");assert!(p.contains("NAMA SPESIFIK")&&p.contains("penutup/ringkasan/cover")&&p.contains("komoditas")&&p.contains("Saman, Aceh")&&p.contains("Children in yellow"));}}
