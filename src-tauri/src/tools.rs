@@ -678,6 +678,12 @@ fn write_slide_inner(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     let (w, h) = crate::lint::canvas(&deck.aspect);
     let mut issues = crate::lint::lint(&deck.slides[inserted_at].html, w, h);
     issues.extend(crate::lint::deck_lint(&deck, inserted_at));
+    {
+        let h=&deck.slides[inserted_at].html;let low=h.to_lowercase();
+        let has_photo=low.contains("<img")&&low.contains("src=\"data:image");
+        let commons=ctx.db.list_assets(&ctx.deck_id).iter().any(|a|a.provenance.as_ref().map_or(false,|p|p.source_url.contains("commons.wikimedia.org")&&!p.creator.is_empty()));
+        if has_photo&&commons&&!low.contains("foto:"){issues.push(crate::lint::Issue{rule:"photo-no-credit".into(),severity:crate::lint::Severity::Error,message:"Slide ini memakai foto Commons tapi tanpa kredit. Tambahkan satu baris kecil (>=18px, satu baris, >=24px dari tepi) persis dari baris KREDIT TERVERIFIKASI foto itu, mis. \"Foto: Nama / Wikimedia (lisensi)\".".into()})}
+    }
     let review = if issues.is_empty() {
         String::from("Pemeriksaan desain: bersih.")
     } else {
