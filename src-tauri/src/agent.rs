@@ -66,7 +66,7 @@ Detail dipilih dari referensi, BUKAN checklist dekorasi:
 - Tekstur opsional dan halus jika referensi memakainya. Jangan pattern titik seragam yang bersaing dengan UI. Latar polos sah bila membantu konten.
 - Hierarki nyata: screenshot/ilustrasi boleh dominan. Tidak semua slide butuh headline besar. Body bisa screenshot + satu caption.
 - Ketegangan spasial: margin asimetris, elemen yang sengaja keluar tepi, baseline yang tidak selalu center.
-- JANGAN menumpuk teks di atas teks lain. Hitung ruang yang benar-benar dipakai setiap blok (font-size × line-height × jumlah baris), bukan cuma `top`-nya. Pengecualian: ghost type dekoratif dengan opacity/alpha sangat rendah di belakang konten.
+- JANGAN menumpuk teks di atas teks lain. Hitung ruang yang benar-benar dipakai setiap blok (font-size × line-height × jumlah baris), bukan cuma `top`-nya. Pengecualian: ghost type dekoratif dengan opacity/alpha sangat rendah di belakang konten, tapi JANGAN pakai nomor slide raksasa ("01", "02") sebagai ghost type: itu klise, selalu menabrak headline dan statistik. Pakai nomor kecil di footer atau tanpa nomor.
 - Palet maksimal 3 warna + 1 aksen. Konsisten di semua slide.
 
 ## Resep tekstur (salin apa adanya, sudah terbukti jalan)
@@ -95,16 +95,12 @@ pub const EXAMPLE_SLIDE: &str = r#"<!doctype html><html><head><meta charset="utf
 html,body{margin:0;width:1080px;height:1350px;overflow:hidden;background:#111010;color:#f3ece2}
 body{font-family:Georgia,serif}
 .grain{position:absolute;inset:0;pointer-events:none;opacity:.13;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
-.ghost{position:absolute;right:-40px;top:150px;font-family:Arial,sans-serif;font-size:520px;line-height:.8;font-weight:700;color:#ffffff0a}
-.rule{position:absolute;left:88px;top:352px;width:120px;height:5px;background:#c8452f}
 .kick{position:absolute;left:88px;top:76px;font-family:Arial,sans-serif;font-size:19px;letter-spacing:.24em;text-transform:uppercase;color:#c8452f}
 h1{position:absolute;left:76px;top:420px;margin:0;width:900px;font-size:186px;line-height:.86;letter-spacing:-.04em;font-weight:400}
 h1 em{font-style:italic;color:#c8452f}
 .dek{position:absolute;left:88px;top:900px;width:600px;font-size:30px;line-height:1.5;color:#a89d90}
 </style></head><body>
 <div class="grain"></div>
-<div class="ghost">01</div>
-<div class="rule"></div>
 <div class="kick">Catatan lapangan</div>
 <h1>Berhenti<br>menambal.<br><em>Mulai ulang.</em></h1>
 <div class="dek">Satu kalimat pendukung, tidak lebih.</div>
