@@ -669,7 +669,8 @@ fn write_slide_inner(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
 
     // Hand the design smells straight back so the model can fix them now.
     let (w, h) = crate::lint::canvas(&deck.aspect);
-    let issues = crate::lint::lint(&deck.slides[inserted_at].html, w, h);
+    let mut issues = crate::lint::lint(&deck.slides[inserted_at].html, w, h);
+    issues.extend(crate::lint::deck_lint(&deck, inserted_at));
     let review = if issues.is_empty() {
         String::from("Pemeriksaan desain: bersih.")
     } else {
@@ -717,7 +718,8 @@ async fn patch_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
             deck.slides[i].html = patched;
             let updated = persist(ctx, &mut deck);
             let (w, h) = crate::lint::canvas(&deck.aspect);
-            let issues = crate::lint::lint(&deck.slides[i].html, w, h);
+            let mut issues = crate::lint::lint(&deck.slides[i].html, w, h);
+            issues.extend(crate::lint::deck_lint(&deck, i));
             let review = if issues.is_empty() {
                 String::from("Pemeriksaan desain: bersih.")
             } else {

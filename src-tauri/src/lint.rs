@@ -809,3 +809,51 @@ mod tests {
 }
 
 #[cfg(test)]mod landscape_tests{#[test]fn landscape_canvas_is_not_portrait_fallback(){assert_eq!(super::canvas("16:9"),(1920.0,1080.0));}}
+
+/// Photo/credit rules that need the whole deck. Rebuilt in run 125b after a workspace loss.
+pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
+    let mut out=vec![];
+    let Some(slide)=deck.slides.get(index) else{return out};
+    out.extend(credit_issues(&slide.html));
+    // repeated photo: identical asset id or identical data-URI body on another slide
+    let keys=|html:&str|->std::collections::HashSet<String>{
+        let doc=scraper::Html::parse_document(html);
+        let sel=scraper::Selector::parse("img").unwrap();
+        doc.select(&sel).filter_map(|i|i.value().attr("src")).map(|s|if s.starts_with("data:"){s.chars().skip(60).take(120).collect::<String>()}else{s.to_string()}).filter(|s|s.len()>=6).collect()
+    };
+    let mine=keys(&slide.html);
+    let dup:Vec<String>=deck.slides.iter().enumerate().filter(|(j,s)|*j!=index&&!s.hidden&&!keys(&s.html).is_disjoint(&mine)).map(|(j,_)|(j+1).to_string()).collect();
+    if !dup.is_empty(){out.push(error("repeated-photo",format!("Foto identik juga dipakai di slide {}. Satu foto hanya boleh muncul sekali per carousel (crop berbeda bukan foto baru): panggil search_commons untuk foto lain, atau ganti dengan angka/diagram bila tidak ada foto yang relevan.",dup.join(", "))))}
+    // photo-sparse: most slides lack any <img>
+    let visible=deck.slides.iter().filter(|s|!s.hidden).count();
+    let with_img=deck.slides.iter().filter(|s|!s.hidden&&s.html.to_ascii_lowercase().contains("<img")).count();
+    if visible>=5&&with_img*2<visible&&index>0&&index+1<deck.slides.len()&&!slide.html.to_ascii_lowercase().contains("<img"){
+        out.push(warn("photo-sparse",format!("Hanya {with_img} dari {visible} slide yang berfoto; slide {} tanpa foto. Bila brief meminta carousel image-led atau foto per slide, panggil search_commons (kata kunci 2 kata sesuai subjek slide) lalu pasang <img> foto >=45% kanvas dengan kredit. Ilustrasi SVG bukan foto.",index+1)))
+    }
+    out
+}
+
+/// Credit-line checks on any element whose text starts with "Foto:".
+pub fn credit_issues(html:&str)->Vec<Issue>{
+    let mut out=vec![];
+    let doc=scraper::Html::parse_document(html);
+    let sel=scraper::Selector::parse("div,p,span,small,figcaption").unwrap();
+    let px=|style:&str|->Option<f32>{let i=style.find("font-size")?;let rest=&style[i+9..];let rest=rest.trim_start_matches([':',' ']);let n:String=rest.chars().take_while(|c|c.is_ascii_digit()||*c=='.').collect();n.parse().ok()};
+    for e in doc.select(&sel){
+        let own:String=e.children().filter_map(|c|c.value().as_text().map(|t|t.to_string())).collect::<Vec<_>>().join(" ");
+        let t=own.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !t.to_lowercase().starts_with("foto:"){continue}
+        if t.to_lowercase().matches("foto:").count()>=2{out.push(error("credit-duplicated-text",format!("Kredit ganda dalam satu elemen: \"{}\". Tulis satu baris kredit saja.",t.chars().take(80).collect::<String>())))}
+        let low=t.to_lowercase();
+        if low.contains("unknown")||low.contains("tidak diketahui")||low.contains("anonim")||t.trim().len()<8{out.push(error("credit-no-name",format!("Kredit tanpa nama fotografer nyata: \"{}\". Pakai persis baris KREDIT TERVERIFIKASI dari import_image atau hapus kredit; jangan mengarang.",t.chars().take(80).collect::<String>())))}
+        if let Some(size)=e.value().attr("style").and_then(px){if size<16.0{out.push(error("credit-tiny",format!("Kredit \"{}\" hanya {size}px; minimal 16px (target 18px) di kanvas 1080px agar terbaca.",t.chars().take(60).collect::<String>())))}}
+    }
+    out
+}
+
+#[cfg(test)]
+mod deck_lint_tests{use super::*;
+fn deck(htmls:&[&str])->crate::model::Deck{let sl:Vec<serde_json::Value>=htmls.iter().enumerate().map(|(i,h)|serde_json::json!({"id":format!("s{i}"),"html":h})).collect();serde_json::from_value(serde_json::json!({"id":"d","aspect":"4:5","slides":sl})).unwrap()}
+#[test]fn repeated_photo_is_an_error(){let d=deck(&["<body><img src=\"asset:a1\"></body>","<body><img src=\"asset:a1\"></body>","<body><img src=\"asset:a2\"></body>"]);assert!(deck_lint(&d,0).iter().any(|i|i.rule=="repeated-photo"&&i.severity==Severity::Error));assert!(!deck_lint(&d,2).iter().any(|i|i.rule=="repeated-photo"));}
+#[test]fn credit_rules(){let bad="<body><div style=\"font-size:12px\">Foto: Unknown author / Wikimedia</div><div>Foto: A / Wikimedia Foto: A / Wikimedia</div></body>";let r:Vec<String>=credit_issues(bad).into_iter().map(|i|i.rule).collect();assert!(r.contains(&"credit-tiny".to_string()));assert!(r.contains(&"credit-no-name".to_string()));assert!(r.contains(&"credit-duplicated-text".to_string()));assert!(credit_issues("<body><div style=\"font-size:18px\">Foto: Adilarmaya / Wikimedia (CC BY-SA 4.0)</div></body>").is_empty());}
+#[test]fn photo_sparse_warns_on_photoless_middle_slides(){let p="<body><img src=\"asset:x\"></body>";let n="<body><p>x</p></body>";let d=deck(&[p,n,n,n,n,n,n]);assert!(deck_lint(&d,3).iter().any(|i|i.rule=="photo-sparse"));assert!(!deck_lint(&d,0).iter().any(|i|i.rule=="photo-sparse"));assert!(!deck_lint(&d,6).iter().any(|i|i.rule=="photo-sparse"));}}
