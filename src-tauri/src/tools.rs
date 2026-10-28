@@ -599,7 +599,7 @@ async fn write_slide(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
     // (CORS, offline), so pull them into the slide as embedded assets the
     // moment they arrive. The model keeps designing with normal URLs and the
     // deck stays portable.
-    let raw=resolve_assets(ctx,&arg_str(args,"html"));
+    let raw=crate::lint::fix_credit_size(&resolve_assets(ctx,&arg_str(args,"html")));
     let (html, notes) = localize_remote_images(&raw).await;
     let mut local_args = args.clone();
     local_args["html"] = json!(html);
@@ -638,7 +638,14 @@ fn write_slide_inner(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
         hidden: false,
     };
 
+    let force=args.get("force").and_then(|v|v.as_bool()).unwrap_or(false);
     let idx = arg_i64(args, "index", -1);
+    if !force&&idx>=0&&(idx as usize)<deck.slides.len(){
+        let (w,h)=crate::lint::canvas(&deck.aspect);
+        let errs=|html:&str|crate::lint::lint(html,w,h).into_iter().filter(|i|i.severity==crate::lint::Severity::Error).count();
+        let (old,new)=(errs(&deck.slides[idx as usize].html),errs(&slide.html));
+        if new>old{return ToolOutcome{content:format!("REWRITE DITOLAK: versi baru punya {new} error lint, versi lama {old}. Slide lama TETAP. Perbaiki versi baru supaya error <= {old} (pakai patch_slide untuk perubahan kecil), atau kirim force=true bila memang disengaja."),deck:None,pause_question:None}}
+    }
     let title_arg = arg_str(args, "title");
     let label = slide.title.clone();
     // An index that already exists is a REWRITE, not an insertion: the agent is
@@ -1147,8 +1154,10 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
     ToolOutcome{content:format!("error: tidak ada foto yang lolos untuk \"{query}\". Dicoba: {}. Pakai kata kunci lain.",tried.join(" | ")),deck:None,pause_question:None}
 }
 
+pub const IMPORT_CAP:usize=14;
 async fn import_image(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
  if !ctx.settings.enable_research{return ToolOutcome{content:"research disabled".into(),deck:None,pause_question:None}}
+ {let n=ctx.db.list_assets(&ctx.deck_id).into_iter().filter(|a|a.id.starts_with("asset_")).count();if n>=IMPORT_CAP{return ToolOutcome{content:format!("error: sudah {n} foto diimpor di deck ini (batas {IMPORT_CAP}). Pakai ulang foto yang ada (list assets) atau hapus kebutuhan foto; jangan impor lagi."),deck:None,pause_question:None}}}
  let url=arg_str(args,"url");let source=arg_str(args,"sourceUrl");let role=arg_str(args,"role");let rights=arg_str(args,"rightsNote");
  if source.trim().is_empty()||role.trim().is_empty()||rights.trim().is_empty(){return ToolOutcome{content:"error: sourceUrl, role and rightsNote required; do not invent licensing permission".into(),deck:None,pause_question:None}}
  let cc=commons_credit(&source).await;let (cc_name,cc_lic)=cc.split_once('|').map(|(a,b)|(a.to_string(),b.to_string())).unwrap_or_default();
@@ -1451,6 +1460,20 @@ mod tests {
 
         let err = apply_patch(html, "teleport", "#t", "", "x").unwrap_err();
         assert!(err.contains("op tidak dikenal"), "{err}");
+    }
+
+    #[test]
+    fn rewrite_that_adds_errors_is_reverted_unless_forced() {
+        let (_p, db, deck_id) = temp_env();
+        let c = ctx(&db, &deck_id);
+        write_slide_inner(&c, &json!({"title":"A","html":"<!doctype html><html><body><h1>Bersih</h1></body></html>"}));
+        let bad = "<!doctype html><html><body><h1>Kotor</h1><script>1</script></body></html>";
+        let out = write_slide_inner(&c, &json!({"index":0,"html":bad}));
+        assert!(out.content.contains("REWRITE DITOLAK"), "{}", out.content);
+        assert!(db.get_deck(&deck_id).unwrap().slides[0].html.contains("Bersih"));
+        let out = write_slide_inner(&c, &json!({"index":0,"html":bad,"force":true}));
+        assert!(!out.content.contains("DITOLAK"));
+        assert!(db.get_deck(&deck_id).unwrap().slides[0].html.contains("Kotor"));
     }
 
     #[tokio::test]

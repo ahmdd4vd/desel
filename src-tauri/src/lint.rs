@@ -851,6 +851,27 @@ pub fn credit_issues(html:&str)->Vec<Issue>{
     out
 }
 
+/// Raise credit text under 18px to 18px, in the opening tag of any element whose own text starts with "Foto:".
+pub fn fix_credit_size(html:&str)->String{
+    let mut out=String::with_capacity(html.len());let mut rest=html;
+    while let Some(p)=rest.find("Foto:"){
+        let (head,tail)=rest.split_at(p);
+        let open=head.rfind('<').unwrap_or(0);
+        let tag=&head[open..];
+        let fixed=match tag.find("font-size:"){
+            Some(i)if tag[..tag.len()].ends_with(|c:char|c!='<')&&tag.contains('>')&&!tag[tag.find('>').unwrap()+1..].contains('<')=>{
+                let s=i+10;let num:String=tag[s..].trim_start().chars().take_while(|c|c.is_ascii_digit()||*c=='.').collect();
+                let off=tag[s..].len()-tag[s..].trim_start().len();
+                match num.parse::<f32>(){Ok(n)if n<18.0=>{let a=s+off;format!("{}18{}",&tag[..a],&tag[a+num.len()..])},_=>tag.to_string()}
+            }
+            _=>tag.to_string()
+        };
+        out.push_str(&head[..open]);out.push_str(&fixed);out.push_str("Foto:");rest=&tail[5..];
+    }
+    out.push_str(rest);out
+}
+#[test]fn credit_autofix(){let h="<div style=\"position:absolute;font-size:12px;color:#fff\">Foto: A / Wikimedia</div><p style=\"font-size:12px\">lain</p>";let f=fix_credit_size(h);assert!(f.contains("font-size:18px;color:#fff\">Foto:"));assert!(f.contains("<p style=\"font-size:12px\">lain"));assert_eq!(fix_credit_size("<p>x</p>"),"<p>x</p>");}
+
 #[cfg(test)]
 mod deck_lint_tests{use super::*;
 fn deck(htmls:&[&str])->crate::model::Deck{let sl:Vec<serde_json::Value>=htmls.iter().enumerate().map(|(i,h)|serde_json::json!({"id":format!("s{i}"),"html":h})).collect();serde_json::from_value(serde_json::json!({"id":"d","aspect":"4:5","slides":sl})).unwrap()}
