@@ -577,7 +577,7 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
     }
 
     let design_brief:String=history.iter().find(|m|m.role=="user").map(|m|m.content.clone()).unwrap_or_default();
-    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;let mut count_nudges:u8=0;let mut lint_nudges:u8=0;
+    let hist_commons:usize=history.iter().flat_map(|m|m.tool_calls.iter()).filter(|c|c.name=="search_commons").count();let mut run_commons=0usize;let mut photo_nudges:u8=0;let mut count_nudges:u8=0;let mut lint_nudges:u8=0;let session_t0=std::time::Instant::now();
     let max_turns = settings.max_turns.clamp(1, 64);
     let mut reviewed:std::collections::HashMap<String,(String,bool)>=std::collections::HashMap::new();
     let mut isolation_failed=false;
@@ -768,13 +768,13 @@ pub async fn run_agent_scoped(db:&Db,settings:&AppSettings,deck_id:&str,history:
                     continue;
                 }}
             }
-            if lint_nudges<3&&turn<max_turns{
+            if lint_nudges<2&&session_t0.elapsed().as_secs()<900&&turn<max_turns{
                 if let Some(d)=db.get_deck(deck_id){
                     let errs:Vec<String>=(0..d.slides.len()).filter(|i|!d.slides[*i].hidden).flat_map(|i|crate::lint::deck_lint(&d,i).into_iter().filter(|x|matches!(x.severity,crate::lint::Severity::Error)).map(move|x|format!("slide {}: [{}] {}",i+1,x.rule,x.message.chars().take(220).collect::<String>())).collect::<Vec<_>>()).collect();
                     if !errs.is_empty(){
                         lint_nudges+=1;
                         wire.push(json!({"role":"assistant","content":text_buf.clone()}));
-                        wire.push(json!({"role":"system","content":format!("Pemeriksaan akhir deck menemukan error yang belum diperbaiki: {}. Perbaiki sekarang dengan patch_slide/write_slide (foto lain lewat search_commons bila foto kembar), jangan berhenti sebelum errornya hilang. Bagian {} dari 3.",errs.into_iter().take(6).collect::<Vec<_>>().join(" | "),lint_nudges)}));
+                        wire.push(json!({"role":"system","content":format!("Pemeriksaan akhir deck menemukan error yang belum diperbaiki: {}. Perbaiki sekarang dengan patch_slide/write_slide (foto lain lewat search_commons bila foto kembar), jangan berhenti sebelum errornya hilang. Bagian {} dari 2.",errs.into_iter().take(6).collect::<Vec<_>>().join(" | "),lint_nudges)}));
                         continue;
                     }
                 }
