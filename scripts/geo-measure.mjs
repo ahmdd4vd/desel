@@ -14,12 +14,22 @@ async function creditContrast(p){
   }
   return issues;
 }
-if(process.argv[2]==='--file'){const b=await puppeteer.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',args:['--no-sandbox']});const p=await b.newPage();await p.setViewport({width:1080,height:1350});await p.setContent(fs.readFileSync(process.argv[3],'utf8'),{waitUntil:'load'});await p.addScriptTag({content:fs.readFileSync(process.argv[4]||'/tmp/g.js','utf8')});console.log(JSON.stringify((await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p))));await b.close();process.exit(0)}
+
+// Pixel check for ALL text: hide every glyph, screenshot the page once, then per text element compare its color (with alpha) to the pixels behind it.
+async function textContrast(p){
+  const items=await p.evaluate(()=>{const out=[];for(const el of Array.from(document.body.querySelectorAll('*'))){const own=Array.from(el.childNodes).filter(n=>n.nodeType===3).map(n=>n.textContent).join(' ').replace(/\s+/g,' ').trim();if(own.length<4)continue;const cs=getComputedStyle(el);if(cs.display==='none'||cs.visibility==='hidden')continue;let op=1;for(let q=el;q&&q!==document.body;q=q.parentElement)op*=Number(getComputedStyle(q).opacity);const m=cs.color.match(/rgba?\(([^)]+)\)/);const c=m[1].split(',').map(Number);const a=(c.length>3?c[3]:1)*op;if(a<.3)continue;const r=el.getBoundingClientRect();if(r.width<8||r.height<8||r.right<0||r.bottom<0||r.left>1080||r.top>1350)continue;out.push({x:Math.max(0,r.left),y:Math.max(0,r.top),w:Math.min(r.width,1080-Math.max(0,r.left)),h:Math.min(r.height,1350-Math.max(0,r.top)),c:[c[0],c[1],c[2]],a,text:own.slice(0,36),fs:parseFloat(cs.fontSize)})}return out});
+  if(!items.length)return [];
+  await p.addStyleTag({content:'*{color:transparent !important;text-shadow:none !important;-webkit-text-fill-color:transparent !important}'});
+  const b64=await p.screenshot({encoding:'base64',clip:{x:0,y:0,width:1080,height:1350}});
+  const res=await p.evaluate(async(b64,items)=>{const img=new Image();img.src='data:image/png;base64,'+b64;await img.decode();const cv=document.createElement('canvas');cv.width=img.width;cv.height=img.height;const x=cv.getContext('2d');x.drawImage(img,0,0);const f=v=>{v/=255;return v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4)};const L=(r,g,b)=>.2126*f(r)+.7152*f(g)+.0722*f(b);const out=[];for(const it of items){const w=Math.max(1,Math.floor(it.w)),h=Math.max(1,Math.floor(it.h));const d=x.getImageData(Math.floor(it.x),Math.floor(it.y),w,h).data;let bad=0,n=0;for(let i=0;i<d.length;i+=4){const br=d[i]*(1)+0,bg=d[i+1],bb=d[i+2];const er=it.a*it.c[0]+(1-it.a)*br,eg=it.a*it.c[1]+(1-it.a)*bg,eb=it.a*it.c[2]+(1-it.a)*bb;const l1=L(er,eg,eb),l2=L(br,bg,bb);const cr=(Math.max(l1,l2)+.05)/(Math.min(l1,l2)+.05);n++;if(cr<(it.fs>=40?2:2.5))bad++}out.push({text:it.text,frac:bad/n,fs:it.fs})}return out},b64,items);
+  return res.filter(r=>r.frac>.3&&r.fs>=20).map(r=>({rule:'text-contrast',severity:'error',message:`Teks "${r.text}" (${Math.round(r.fs)}px) kontrasnya rendah di ${Math.round(r.frac*100)}% areanya karena foto/latar ramai di belakangnya. Beri scrim gradien gelap/terang atau panel solid di belakang teks, atau pindahkan teks ke area foto yang polos.`}));
+}
+if(process.argv[2]==='--file'){const b=await puppeteer.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',args:['--no-sandbox']});const p=await b.newPage();await p.setViewport({width:1080,height:1350});await p.setContent(fs.readFileSync(process.argv[3],'utf8'),{waitUntil:'load'});await p.addScriptTag({content:fs.readFileSync(process.argv[4]||'/tmp/g.js','utf8')});console.log(JSON.stringify((await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).concat(await textContrast(p))));await b.close();process.exit(0)}
 const dir=process.argv[2];const gjs=process.argv[3]||'/tmp/g.js';
 const titles=fs.existsSync(`${dir}/titles.json`)?JSON.parse(fs.readFileSync(`${dir}/titles.json`,'utf8')):[];
 const n=fs.readdirSync(dir).filter(f=>/^\d+\.html$/.test(f)).length;
 const b=await puppeteer.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',args:['--no-sandbox']});const p=await b.newPage();await p.setViewport({width:1080,height:1350});
 for(let i=0;i<n;i++){await p.setContent(fs.readFileSync(`${dir}/${i}.html`,'utf8'),{waitUntil:'load'});await p.addScriptTag({content:fs.readFileSync(gjs,'utf8')});
-const r=(await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).filter(x=>x.severity==='error').map(x=>x.message);
+const r=(await p.evaluate(()=>G.measureOverlapIssues(document))).concat(await creditContrast(p)).concat(await textContrast(p)).filter(x=>x.severity==='error').map(x=>x.message);
 for(const m of r)console.log(`Slide ${i+1} ("${titles[i]||''}"): ${m}`);}
 await b.close();
