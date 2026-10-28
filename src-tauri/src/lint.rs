@@ -816,6 +816,7 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     let Some(slide)=deck.slides.get(index) else{return out};
     out.extend(credit_issues(&slide.html));
     out.extend(divider_issues(&slide.html));
+    if let Some((kk,n))=page_marker(&slide.html){let total=deck.slides.iter().filter(|s|!s.hidden).count();if n==total&&kk!=index+1{out.push(error("slide-order",format!("Penanda halaman \"{kk}/{n}\" tidak sama dengan posisi slide ({}/{total}). Urutan slide salah: tulis ulang slide dengan index yang benar atau perbaiki nomornya.",index+1)))}}
     // repeated photo: identical asset id or identical data-URI body on another slide
     let keys=|html:&str|->std::collections::HashSet<String>{
         let doc=scraper::Html::parse_document(html);
@@ -850,6 +851,14 @@ pub fn divider_issues(html:&str)->Vec<Issue>{
     }
     out
 }
+
+/// "NN / MM" page marker in slide text (first match, 1<=NN<=MM<=30).
+pub fn page_marker(html:&str)->Option<(usize,usize)>{
+    let doc=scraper::Html::parse_document(html);let text:String=doc.root_element().text().collect::<Vec<_>>().join(" ");
+    let re=regex::Regex::new(r"(?:^|\D)(\d{1,2})\s*/\s*(\d{1,2})(?:\D|$)").ok()?;
+    for c in re.captures_iter(&text){let a:usize=c[1].parse().ok()?;let b:usize=c[2].parse().ok()?;if a>=1&&a<=b&&b>=2&&b<=30{return Some((a,b))}}None
+}
+#[test]fn page_marker_and_order(){assert_eq!(page_marker("<body><div>05 / 06</div></body>"),Some((5,6)));assert_eq!(page_marker("<body>3/4 cup</body>"),Some((3,4)));assert_eq!(page_marker("<body>no</body>"),None);}
 
 pub fn credit_issues(html:&str)->Vec<Issue>{
     let mut out=vec![];

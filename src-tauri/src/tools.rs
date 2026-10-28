@@ -1125,6 +1125,37 @@ async fn judge_photo_relevance(settings:&AppSettings,role:&str,message:&str,meta
     Verdict::Unavailable
 }
 
+/// Commons description + categories + GPS (extmetadata) for a file page.
+async fn commons_meta(source:&str)->(String,Option<(f64,f64)>){
+    let work=async{
+        let t=source.split("/wiki/").nth(1)?; if !source.contains("commons.wikimedia.org"){return None;}
+        let title=t.split(['#','?']).next()?;
+        let api=format!("https://commons.wikimedia.org/w/api.php?action=query&titles={title}&prop=imageinfo&iiprop=extmetadata&format=json");
+        let url=validate_image_url(&api).ok()?;let client=pinned_client(&url).await.ok()?;
+        let txt=client.get(url).header("User-Agent","DeselCarouselApp/1.0").send().await.ok()?.text().await.ok()?;
+        let v:serde_json::Value=serde_json::from_str(&txt).ok()?;
+        let em=v.get("query")?.get("pages")?.as_object()?.values().next()?.get("imageinfo")?.get(0)?.get("extmetadata")?.clone();
+        let g=|k:&str|em.get(k).and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_string();
+        let tag=regex::Regex::new(r"(?s)<[^>]*>").ok()?;
+        let text=format!("{} | {}",tag.replace_all(&g("ImageDescription"),""),g("Categories").replace('|',", "));
+        let gps=match(g("GPSLatitude").parse::<f64>(),g("GPSLongitude").parse::<f64>()){(Ok(a),Ok(b))=>Some((a,b)),_=>None};
+        Some((text.chars().take(400).collect::<String>(),gps))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(8),work).await.ok().flatten().unwrap_or_default()
+}
+
+const ID_WORDS:[&str;24]=["indonesia","sumba","ntt","bali","jawa","java","sumatera","sumatra","kalimantan","banjarmasin","sulawesi","toraja","papua","lombok","flores","maluku","aceh","yogyakarta","jakarta","nusantara","minangkabau","dayak","batak","borneo"];
+const FOREIGN_WORDS:[&str;24]=["india","odisha","bangladesh","vietnam","thailand","myanmar","burma","pakistan","nepal","china","philippines","laos","cambodia","sri lanka","africa","peru","guatemala","mexico","turkey","iran","morocco","japan","korea","malaysia"];
+fn has_word(hay:&str,w:&str)->bool{let h=hay.to_lowercase();let mut from=0;while let Some(p)=h[from..].find(w){let a=from+p;let b=a+w.len();let ok_a=a==0||!h[..a].chars().last().unwrap().is_alphanumeric();let ok_b=b>=h.len()||!h[b..].chars().next().unwrap().is_alphanumeric();if ok_a&&ok_b{return true}from=b;}false}
+/// True when the brief is about an Indonesian place but the file metadata/GPS says elsewhere.
+pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
+    if !ID_WORDS.iter().any(|w|has_word(brief,w)){return false}
+    if let Some((la,lo))=gps{if !(la>=-11.5&&la<=6.5&&lo>=94.5&&lo<=141.5){return true}}
+    FOREIGN_WORDS.iter().any(|w|has_word(meta,w)&&!has_word(brief,w))
+}
+pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","diagram","logo","poster","document","pdf","djvu","table","chart","map of","text","letter"].iter().any(|w|has_word(title,w))}
+#[test]fn geo_and_doc_filters(){assert!(foreign_for_brief("tenun ikat Sumba","Weaver, Looms in Bangladesh",None));assert!(foreign_for_brief("tenun Sumba","",Some((22.0,85.0))));assert!(!foreign_for_brief("tenun Sumba","Kain Sumba, Nusa Tenggara",Some((-9.6,119.9))));assert!(!foreign_for_brief("weaving in India","India loom",None));assert!(looks_like_document("File:Der Farbenfabrikant page 33.jpg"));assert!(!looks_like_document("Tenun ikat Sumba.jpg"));}
+
 async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
     if !ctx.settings.enable_research{return ToolOutcome{content:"error: research disabled".into(),deck:None,pause_question:None}}
     let query=arg_str(args,"query");let role=arg_str(args,"role");let msg=arg_str(args,"slideMessage");
@@ -1139,13 +1170,18 @@ async fn search_commons(ctx:&ToolContext<'_>,args:&Value)->ToolOutcome{
         words.pop();
     }
     if cands.is_empty(){return ToolOutcome{content:format!("error: Commons tidak punya foto layak untuk \"{query}\". Coba kata kunci lebih umum atau berbeda."),deck:None,pause_question:None}}
+    let brief:String=ctx.db.list_messages(&ctx.deck_id).into_iter().find(|m|m.role=="user").map(|m|m.content).unwrap_or_default();
     let mut tried=vec![];
     let mut named=0;
     for (thumb,page,title) in cands.into_iter().take(8){
         if named>=4{break}
         if commons_credit(&page).await.is_empty(){tried.push(format!("{title}: fotografer tidak bernama"));continue}
         named+=1;
-        if judge_photo_relevance(&ctx.settings,&role,&msg,&title).await==Verdict::No{tried.push(format!("{title}: ditolak juri subjek"));continue}
+        if looks_like_document(&title){tried.push(format!("{title}: dokumen/scan, bukan foto subjek"));continue}
+        let (meta,gps)=commons_meta(&page).await;
+        if foreign_for_brief(&brief,&format!("{title} {meta}"),gps){tried.push(format!("{title}: lokasi di luar daerah brief"));continue}
+        let jmeta=format!("{title}. {meta}");
+        if judge_photo_relevance(&ctx.settings,&role,&format!("{msg} [Brief carousel: {}]",brief.chars().take(200).collect::<String>()),&jmeta).await==Verdict::No{tried.push(format!("{title}: ditolak juri subjek"));continue}
         let a=json!({"url":thumb,"sourceUrl":page,"role":role,"slideMessage":msg,"rightsNote":"Wikimedia Commons, lisensi bebas; fotografer dari halaman file"});
         let out=import_image(ctx,&a).await;
         if out.content.starts_with("Imported "){return out}
