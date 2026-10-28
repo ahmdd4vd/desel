@@ -131,7 +131,7 @@ Tulis HTML yang benar-benar jalan. Jangan pernah menulis placeholder seperti "<!
 /// Rules, then the worked example, then the automated review rules that the
 /// example already satisfies.
 pub fn system_prompt() -> String {
-    format!("{PROMPT_HEAD}\n\n{PROMPT_TAIL}\n\n## Foto\nPakai search_commons (cari+impor, kata kunci 2 kata per slide), jangan tebak URL. Brief yang meminta foto: setiap slide isi punya foto nyata, bukan ilustrasi SVG. Kredit = baris KREDIT TERVERIFIKASI persis, minimal 18px, satu baris. Satu foto sekali per carousel.\n\n## Acuan user mengalahkan resep\nJangan memakai satu contoh HTML yang sama sebagai template. Sebelum menulis, uraikan singkat grammar visual referensi: subjek, rasio image/teks, grid, huruf, warna, ruang. Terjemahkan komposisi, bukan sekadar warna. Jangan memaksakan judul raksasa Georgia, italic aksen, ghost number, pattern titik, atau tabel fakta jika referensi tidak memakainya. Pada screenshot produk, warna dalam gambar bukan pelanggaran palet desain. Saran linter estetika adalah heuristik, bukan kebenaran; jangan mengubah desain baik hanya demi skor. Jika referensi cover memakai artwork/foto kuat, buat atau cari aset bermakna yang sah, jangan gantikan dengan headline kosong. Bila tool pembuatan/edit gambar tidak tersedia, sebut keterbatasannya, bukan klaim membuat artwork.")
+    format!("{PROMPT_HEAD}\n\n{PROMPT_TAIL}\n\n## Foto\nPakai search_commons (cari+impor, kata kunci 2 kata per slide), jangan tebak URL. Brief yang meminta foto: setiap slide isi punya foto nyata, bukan ilustrasi SVG. Kredit = baris KREDIT TERVERIFIKASI persis, minimal 18px, satu baris. Satu foto sekali per carousel. Jangan pakai garis dekoratif (rule/divider/hairline pendek di bawah judul): pisahkan dengan jarak dan ukuran huruf.\n\n## Acuan user mengalahkan resep\nJangan memakai satu contoh HTML yang sama sebagai template. Sebelum menulis, uraikan singkat grammar visual referensi: subjek, rasio image/teks, grid, huruf, warna, ruang. Terjemahkan komposisi, bukan sekadar warna. Jangan memaksakan judul raksasa Georgia, italic aksen, ghost number, pattern titik, atau tabel fakta jika referensi tidak memakainya. Pada screenshot produk, warna dalam gambar bukan pelanggaran palet desain. Saran linter estetika adalah heuristik, bukan kebenaran; jangan mengubah desain baik hanya demi skor. Jika referensi cover memakai artwork/foto kuat, buat atau cari aset bermakna yang sah, jangan gantikan dengan headline kosong. Bila tool pembuatan/edit gambar tidak tersedia, sebut keterbatasannya, bukan klaim membuat artwork.")
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2302,9 +2302,9 @@ mod live_provider_tests_2 {
         dump("live-photo", &db, &seen);
         let deck = db.get_deck("live_deck").expect("deck");
         let (w, h) = crate::lint::canvas(&deck.aspect);
-        std::fs::create_dir_all("/tmp/live-out").ok();
+        let outd=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());std::fs::create_dir_all(&outd).ok();
         for (i, s) in deck.slides.iter().enumerate() {
-            std::fs::write(format!("/tmp/live-out/{i}.html"), &s.html).ok();
+            std::fs::write(format!("{outd}/{i}.html"), &s.html).ok();
             let iss = crate::lint::lint(&s.html, w, h);
             println!("[live] slide {i} \"{}\" lint: {}", s.title, crate::lint::summarise(&iss).replace('\n', " | "));
         }

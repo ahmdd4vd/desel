@@ -815,6 +815,7 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     let mut out=vec![];
     let Some(slide)=deck.slides.get(index) else{return out};
     out.extend(credit_issues(&slide.html));
+    out.extend(divider_issues(&slide.html));
     // repeated photo: identical asset id or identical data-URI body on another slide
     let keys=|html:&str|->std::collections::HashSet<String>{
         let doc=scraper::Html::parse_document(html);
@@ -834,6 +835,22 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
 }
 
 /// Credit-line checks on any element whose text starts with "Foto:".
+/// Static check for empty accent rules: a declaration block with a 1-6px height, a width and a background (no text-bearing use).
+pub fn divider_issues(html:&str)->Vec<Issue>{
+    let mut out=vec![];
+    let mut blocks:Vec<String>=vec![];
+    let mut rest=html;
+    while let Some(i)=rest.find('{'){let Some(j)=rest[i..].find('}')else{break};blocks.push(rest[i+1..i+j].to_string());rest=&rest[i+j+1..];}
+    let doc=scraper::Html::parse_document(html);
+    if let Ok(sel)=scraper::Selector::parse("[style]"){for e in doc.select(&sel){if e.children().next().is_none(){if let Some(s)=e.value().attr("style"){blocks.push(s.to_string())}}}}
+    let num=|b:&str,prop:&str|->Option<f32>{let mut from=0;while let Some(p)=b[from..].find(prop){let at=from+p;let pre=b[..at].chars().last();from=at+prop.len();if pre.map_or(false,|c|c.is_ascii_alphanumeric()||c=='-'){continue}let r=b[from..].trim_start();let r=r.strip_prefix(':')?.trim_start();let n:String=r.chars().take_while(|c|c.is_ascii_digit()||*c=='.').collect();if r[n.len()..].starts_with("px"){return n.parse().ok()}return None}None};
+    for b in &blocks{
+        let (Some(h),Some(w))=(num(b,"height"),num(b,"width"))else{continue};
+        if h>=1.0&&h<=6.0&&w>=h*8.0&&w<=500.0&&(b.contains("background")||b.contains("border")){out.push(error("decorative-divider",format!("Garis dekoratif {w}x{h}px. Hapus. Pisahkan blok dengan jarak, ukuran huruf, atau warna, bukan garis.")));break}
+    }
+    out
+}
+
 pub fn credit_issues(html:&str)->Vec<Issue>{
     let mut out=vec![];
     let doc=scraper::Html::parse_document(html);
@@ -871,6 +888,8 @@ pub fn fix_credit_size(html:&str)->String{
     out.push_str(rest);out
 }
 #[test]fn credit_autofix(){let h="<div style=\"position:absolute;font-size:12px;color:#fff\">Foto: A / Wikimedia</div><p style=\"font-size:12px\">lain</p>";let f=fix_credit_size(h);assert!(f.contains("font-size:18px;color:#fff\">Foto:"));assert!(f.contains("<p style=\"font-size:12px\">lain"));assert_eq!(fix_credit_size("<p>x</p>"),"<p>x</p>");}
+
+#[test]fn divider_rule(){assert!(!divider_issues("<style>.rule{width:96px;height:3px;background:#c8452b}</style><div class=rule></div>").is_empty());assert!(!divider_issues("<div style=\"width:60px;height:2px;background:#fff\"></div>").is_empty());assert!(divider_issues("<style>.p{width:600px;height:900px;background:#000}.l{line-height:3px}</style>").is_empty());}
 
 #[cfg(test)]
 mod deck_lint_tests{use super::*;
