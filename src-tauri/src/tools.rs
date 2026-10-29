@@ -1164,7 +1164,7 @@ pub fn subject_repeat(cand_title:&str,used_pages:&[String],brief:&str)->bool{
     let brief_l=brief.to_lowercase();
     let stop=["file","jpg","jpeg","png","commons","wikimedia","indonesia","indonesian","java","javanese","with","from","street","photo","view","the","and","dari","yang"];
     let toks=|t:&str|->std::collections::HashSet<String>{t.to_lowercase().replace(|c:char|!c.is_alphanumeric()," ").split_whitespace().filter(|w|w.len()>=4&&!stop.contains(w)&&!w.chars().all(|c|c.is_ascii_digit())).map(String::from).collect()};
-    let c:std::collections::HashSet<String>=toks(cand_title).into_iter().filter(|w|!brief_l.contains(w.as_str())).collect();
+    let c:std::collections::HashSet<String>=toks(cand_title).into_iter().filter(|w|!has_word(&brief_l,w)).collect();
     used_pages.iter().any(|u|{let tail=u.rsplit('/').next().unwrap_or("");let t=toks(&tail.replace("%20"," "));c.intersection(&t).count()>=2})
 }
 
@@ -1233,6 +1233,7 @@ pub fn foreign_for_brief(brief:&str,meta:&str,gps:Option<(f64,f64)>)->bool{
     FOREIGN_WORDS.iter().any(|w|has_word(meta,w)&&!has_word(brief,w))
 }
 pub fn looks_like_document(title:&str)->bool{["page","seite","scan","book","buch","manuscript","inscription","plaque","handwritten","handwriting","certificate","newspaper","naskah","surat","dokumen","tulisan","signature","diagram","logo","poster","document","pdf","djvu","table","chart","map of","peta","grafik","bagan","perangko","prangko","stamp","stempel","text","letter","informasi","infografis","infographic","skema"].iter().any(|w|has_word(title,w))}
+#[test]fn subject_repeat_substring_hole(){let used=vec!["https://commons.wikimedia.org/wiki/File:Nicolaas_Pieneman_-_The_Submission_of_Prince_Dipo_Negoro_to_General_De_Kock.jpg".to_string()];let brief="Pangeran Diponegoro: pangeran Yogya yang mengobarkan Perang Jawa 1825-1830";assert!(subject_repeat("File:Dutch Painting in the 19th Century - N. Pieneman - The Surrender of Diepo Negoro.png",&used,brief));assert!(!subject_repeat("File:Makam Pangeran Diponegoro.jpg",&used,brief));}
 #[test]fn geo_city_briefs_reject_foreign(){assert!(foreign_for_brief("pempek Palembang","Scomberomorus commerson Philippines",None));assert!(!foreign_for_brief("pempek Palembang","Pempek Kuah Cuko",None));}
 
 #[test]fn medium_artwork_maps_lukisan(){assert_eq!(medium_from_categories("the arrest of pangeran diponegoro|pd-art (pd-old-auto-expired)|artworks with wikidata item"),"Lukisan");assert_eq!(medium_from_categories("lithographs|history"),"Litografi");assert_eq!(medium_from_categories("photographs of java"),"Foto");}
