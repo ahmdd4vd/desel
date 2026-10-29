@@ -205,6 +205,10 @@ pub fn lint(html: &str, w: f32, h: f32) -> Vec<Issue> {
     if hay.contains("<script") {
         issues.push(error("no-script", "Ada <script>. Slide harus statis."));
     }
+    {
+        let re=regex::Regex::new(r">\s*(SIMPAN|BAGIKAN|SHARE|SAVE|FOLLOW|KOMENTAR|BERANDA)\s*<").unwrap();
+        if re.is_match(html){issues.push(error("ui-palsu","Slide memuat elemen UI aplikasi palsu (tombol/label SIMPAN, BAGIKAN, SHARE, dsb). Slide adalah kanvas statis carousel, bukan antarmuka aplikasi - aksi simpan/bagikan disediakan aplikasi di luar kanvas. Hapus elemen UI itu; ganti dengan tipografi biasa bila perlu."));}
+    }
     if hay.contains("@import") {
         issues.push(error(
             "no-import",
@@ -683,6 +687,12 @@ mod tests {
     }
 
     #[test]
+    fn ui_palsu_dilarang() {
+        let html=String::from("<html><body><div><span>SIMPAN</span><span>BAGIKAN</span></div></body></html>");
+        assert!(lint(&html,1080.0,1350.0).iter().any(|i|i.rule=="ui-palsu"));
+        let prose=String::from("<html><body><p>Sajaknya disimpan di arsip negara dan dibagikan ke pembaca.</p></body></html>");
+        assert!(!lint(&prose,1080.0,1350.0).iter().any(|i|i.rule=="ui-palsu"));
+    }
     fn separated_blocks_and_ghost_type_stay_legal() {
         let html = r#"<!doctype html><html><head><style>
             html,body{margin:0;width:1080px;height:1350px;background:#EDE4D2;color:#16130F;font-family:Georgia}

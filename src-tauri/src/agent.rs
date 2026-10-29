@@ -2386,6 +2386,7 @@ mod live_provider_tests_2 {
                     }
                 }
             }
+            for l in &lines{eprintln!("[temuan] {l}");}
             println!("[live] geometry round {round}: {} error findings", lines.len());
             if lines.is_empty(){break}
             if lines.len()>=prev_errors{stalls+=1;if stalls>=6{println!("[live] geometry stalled (retry provider tanpa progres); berhenti dengan {} error residu",lines.len());break}let wait=std::cmp::min(60+30*(stalls-1),120);println!("[live] geometry tanpa progres (kemungkinan 429); backoff {wait} detik sebelum ronde berikutnya");std::thread::sleep(std::time::Duration::from_secs(wait as u64));}else{stalls=0}
@@ -2734,3 +2735,4 @@ mod creator_executor_tests {
         drop(db);let _=std::fs::remove_file(p);
     }
 }
+
