@@ -192,6 +192,10 @@ pub fn lint(html: &str, w: f32, h: f32) -> Vec<Issue> {
 
     // Decoration can invert the claim even when every word is sourced.
     // Conservative warning, not a semantic correctness verdict.
+    {
+        let shapes=hay.matches("<circle").count()+hay.matches("<rect").count()+hay.matches("<ellipse").count()+hay.matches("<polygon").count()+hay.matches("<line").count();
+        if shapes>=4{issues.push(error("diagram-buatan","Slide berisi diagram/ilustrasi buatan agen (SVG dengan banyak bentuk). Dilarang: carousel ini image-led. Slide tanpa foto harus menang lewat tipografi dan komposisi, bukan gambar buatan. Hapus SVG diagramnya; satu path dekoratif kecil (garis lengkung) masih boleh."));}
+    }
     if hay.contains("line-through") || hay.contains("strike:after") || hay.contains("strike::after") || hay.contains("<s>") || hay.contains("<del") {
         issues.push(warn("semantic-decoration", "Coretan/penghapusan dapat membalik makna, terutama tanpa/tidak/no/without. Periksa kalimat yang dibaca dari render; hapus dekorasi bila negasi menjadi ambigu. Ini peringatan, bukan bukti klaim salah."));
     }
@@ -872,6 +876,20 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     out.extend(divider_issues(&slide.html));
     {
         let fp=|h:&str|->Vec<String>{let mut v=vec![];let mut rest=h;while let Some(p)=rest.find("src=\"data:image"){let s=&rest[p+5..];let e=s.find('"').unwrap_or(s.len());v.push(s[..e.min(240)].to_string());rest=&s[e.min(s.len())..];}v};
+        {
+            let re=regex::Regex::new(r"([A-Z\u{00C0}-\u{00DE}][A-Z\u{00C0}-\u{00DE} .,'-]{5,60})\(\s*(1[5-9]\d{2}|20\d{2})\s*[-\u{2013}\u{2014}]\s*(1[5-9]\d{2}|20\d{2})\s*\)").unwrap();
+            let tw:Vec<String>=deck.title.to_lowercase().split_whitespace().map(|w|w.trim_matches(|c:char|!c.is_alphanumeric()).to_string()).filter(|w|w.len()>=3).collect();
+            for cap in re.captures_iter(&slide.html){
+                let name=cap[1].trim();
+                let y1:i32=cap[2].parse().unwrap_or(0);let y2:i32=cap[3].parse().unwrap_or(0);
+                if !(15..=110).contains(&(y2-y1)){continue}
+                let words:Vec<String>=name.to_lowercase().split_whitespace().map(|w|w.trim_matches(|c:char|!c.is_alphanumeric()).to_string()).filter(|w|w.len()>=3).collect();
+                if words.len()>=2&&words.iter().all(|w|!tw.contains(w)){
+                    let msg=format!("Slide ini menampilkan label tokoh \"{name}\" dengan tahun hidupnya, padahal subjek deck adalah \"{}\". Bila ini tokoh berbeda (foto/label salah orang), ganti dengan subjek yang benar. Label tokoh lain hanya boleh bila slide memang membahas tokoh itu.",deck.title);
+                    if index==0{out.push(error("wrong-person-label",msg))}else{out.push(warn("wrong-person-label",msg))}
+                }
+            }
+        }
         let mine=fp(&slide.html);
         let others:Vec<String>=deck.slides.iter().enumerate().filter(|(i,s)|*i!=index&&!s.hidden).flat_map(|(_,s)|fp(&s.html)).collect();
         if mine.iter().any(|m|others.iter().any(|o|o==m)){out.push(error("asset-reused","Foto yang sama persis dipakai di slide lain juga. Satu foto satu slide: ganti foto ini dengan foto Commons berbeda (search_commons), jangan pakai ulang aset yang sama."))}
@@ -1029,5 +1047,7 @@ mod asset_reuse_tests{
     use super::*;
     fn deck_with(a:&str,b:&str)->crate::model::Deck{let sl:Vec<serde_json::Value>=[a,b].iter().enumerate().map(|(i,h)|serde_json::json!({"id":format!("s{i}"),"html":h})).collect();serde_json::from_value(serde_json::json!({"id":"d","aspect":"4:5","slides":sl})).unwrap()}
     #[test]fn same_photo_two_slides_flagged(){let img="src=\"data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD1234567890abcdefghij\"";let d=deck_with(&format!("<img {img}>"),&format!("<p>x</p><img {img}>"));let iss=deck_lint(&d,1);assert!(iss.iter().any(|i|i.rule=="asset-reused"),"{iss:?}")}
+    #[test]fn wrong_person_label_flagged(){let d=deck_with("<h1>Dewi Sartika</h1>","<p>RADEN ADJENG KARTINI (1879-1904)</p>");let mut d=d;d.title="Dewi Sartika".into();let iss=deck_lint(&d,1);assert!(iss.iter().any(|i|i.rule=="wrong-person-label"),"{iss:?}");let iss0=deck_lint(&deck_with("<p>PERANG JAWA (1825-1830) adalah konflik besar</p>","<p>x</p>"),0);assert!(!iss0.iter().any(|i|i.rule=="wrong-person-label"),"rentang peristiwa bukan umur: {iss0:?}")}
+    #[test]fn diagram_buatan_flagged(){let iss=lint("<body><svg><circle cx=1 cy=1 r=2/><line x1=0 y1=0 x2=1 y2=1/><line x1=1 y1=0 x2=0 y2=1/><rect width=5 height=5/></svg></body>",1080.0,1350.0);assert!(iss.iter().any(|i|i.rule=="diagram-buatan"),"{iss:?}");let ok=lint("<body><svg><path d=\"M0 0 Q5 5 10 0\"/></svg><p>tipografi kuat</p></body>",1080.0,1350.0);assert!(!ok.iter().any(|i|i.rule=="diagram-buatan"),"{ok:?}")}
     #[test]fn different_photos_ok(){let d=deck_with("<img src=\"data:image/jpeg;base64,AAAA1111BBBB2222CCCC3333DDDD\">","<img src=\"data:image/png;base64,ZZZZ9999YYYY8888XXXX7777WWWW\">");let iss=deck_lint(&d,1);assert!(!iss.iter().any(|i|i.rule=="asset-reused"),"{iss:?}")}
 }
