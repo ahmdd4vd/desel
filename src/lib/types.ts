@@ -186,7 +186,7 @@ export interface ImageProfile {
   lightRatio: number;
 }
 
-export interface AssetProvenance { sourceUrl:string; creator:string; rightsNote:string; altText:string; }
+export interface AssetProvenance { sourceUrl:string; creator:string; rightsNote:string; altText:string; medium:string; }
 export interface Asset {
   provenance?:AssetProvenance|null;
   referenceRole?: "" | "cover" | "body" | "closer" | "asset";

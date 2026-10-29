@@ -18,7 +18,7 @@ const deck = {
   fromTemplateId: null, createdAt: '2026-01-02T03:04:05Z', updatedAt: '2026-01-02T03:04:05Z',
 };
 const assets = [{
-  provenance: { sourceUrl: 'https://example.com/pic', creator: 'Fixture', rightsNote: 'unverified', altText: 'dot' },
+  provenance: { sourceUrl: 'https://example.com/pic', creator: 'Fixture', rightsNote: 'unverified', altText: 'dot', medium: '' },
   referenceRole: 'cover', referenceStatus: 'approved', id: 'asset_pic', deckId: 'deck_fixture',
   name: 'pic.png', mime: 'image/png', data: png,
   profile: { width: 1, height: 1, palette: ['#ffffff'], luminance: 1, contrast: 0, lightRatio: 1 },

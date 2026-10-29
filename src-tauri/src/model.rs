@@ -151,6 +151,7 @@ pub struct AssetProvenance {
     #[serde(default)] pub creator: String,
     #[serde(default)] pub rights_note: String,
     #[serde(default)] pub alt_text: String,
+    #[serde(default)] pub medium: String,
 }
 impl AssetProvenance {
  pub fn validate(&self)->Result<(),String>{

@@ -40,8 +40,8 @@ const slideJson = (s: { id: string; title?: string; html?: string; rationale?: s
 const deckJson = (d: Deck) =>
   `{"id":${str(d.id)},"title":${str(d.title)},"caption":${str(d.caption)},"aspect":${str(d.aspect)},"slides":[${d.slides.map(slideJson).join(",")}],"styleGuide":${str(d.styleGuide)},"palette":[${d.palette.map(str).join(",")}],"brandHandle":${str(d.brandHandle)},"saveLabel":${str(d.saveLabel)},"fromTemplateId":${d.fromTemplateId == null ? "null" : str(d.fromTemplateId)},"createdAt":${str(d.createdAt)},"updatedAt":${str(d.updatedAt)}}`;
 
-const provenanceJson = (p: { sourceUrl?: string; creator?: string; rightsNote?: string; altText?: string }) =>
-  `{"sourceUrl":${str(p.sourceUrl ?? "")},"creator":${str(p.creator ?? "")},"rightsNote":${str(p.rightsNote ?? "")},"altText":${str(p.altText ?? "")}}`;
+const provenanceJson = (p: { sourceUrl?: string; creator?: string; rightsNote?: string; altText?: string; medium?: string }) =>
+  `{"sourceUrl":${str(p.sourceUrl ?? "")},"creator":${str(p.creator ?? "")},"rightsNote":${str(p.rightsNote ?? "")},"altText":${str(p.altText ?? "")},"medium":${str(p.medium ?? "")}}`;
 
 const profileJson = (p: { width: number; height: number; palette: string[]; luminance: number; contrast: number; lightRatio: number }) =>
   `{"width":${p.width},"height":${p.height},"palette":[${p.palette.map(str).join(",")}],"luminance":${f64(p.luminance)},"contrast":${f64(p.contrast)},"lightRatio":${f64(p.lightRatio)}}`;
