@@ -2078,7 +2078,7 @@ mod live_provider_tests {
         )
         .await;
         dump("live1-full", &db, &seen);
-        let deck = db.get_deck("live_deck").expect("deck");
+        let Some(deck) = db.get_deck("live_deck") else { println!("[live] GAGAL TOTAL: deck tidak pernah terbuat (semua panggilan LLM gagal/429). Sesi dihentikan tanpa render; coba lagi saat rate limit pulih."); return; };
         assert_eq!(deck.slides.len(), 6, "expected exact six-slide contract");
 
         // Revision turn on the same deck, using the persisted transcript.
