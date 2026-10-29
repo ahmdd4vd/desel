@@ -2406,7 +2406,7 @@ mod live_provider_tests_2 {
             let iss = crate::lint::lint(&s.html, w, h);
             println!("[live] slide {i} \"{}\" lint: {}", s.title, crate::lint::summarise(&iss).replace('\n', " | "));
         }
-        let noph=photoless_slides(&deck);
+        let noph:Vec<usize>=deck.slides.iter().enumerate().filter(|(_,s)|!s.hidden&&!s.html.to_ascii_lowercase().contains("<img")).map(|(i,_)|i).collect();
         if !noph.is_empty(){println!("[live] POOL MISKIN: slide {noph:?} tanpa foto setelah semua ronde - pool Commons kemungkinan habis/terlalu sempit untuk brief ini; dilaporkan apa adanya, tidak dipaksakan.");}
         println!("[live] slides={}", deck.slides.len());
     }
