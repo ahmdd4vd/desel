@@ -2078,7 +2078,7 @@ mod live_provider_tests {
         )
         .await;
         dump("live1-full", &db, &seen);
-        let Some(deck) = db.get_deck("live_deck") else { println!("[live] GAGAL TOTAL: deck tidak pernah terbuat (semua panggilan LLM gagal/429). Sesi dihentikan tanpa render; coba lagi saat rate limit pulih."); return; };
+        let deck = db.get_deck("live_deck").expect("deck");
         assert_eq!(deck.slides.len(), 6, "expected exact six-slide contract");
 
         // Revision turn on the same deck, using the persisted transcript.
@@ -2408,7 +2408,7 @@ mod live_provider_tests_2 {
             run_agent(&db,&settings,"live_deck",hist,Vec::new(),std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),c3).await;
         }
         dump("live-photo", &db, &seen);
-        let deck = db.get_deck("live_deck").expect("deck");
+        let Some(deck) = db.get_deck("live_deck") else { println!("[live] GAGAL TOTAL: deck tidak pernah terbuat (semua panggilan LLM gagal/429). Sesi berakhir tanpa render; coba lagi saat rate limit pulih."); return; };
         let (w, h) = crate::lint::canvas(&deck.aspect);
         let outd=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());std::fs::create_dir_all(&outd).ok();
         for (i, s) in deck.slides.iter().enumerate() {
