@@ -2352,21 +2352,21 @@ mod live_provider_tests_2 {
         run_agent(&db, &settings, "live_deck", vec![msg], Vec::new(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), channel).await;
         let want:usize=std::env::var("LIVE_N").ok().and_then(|v|v.parse().ok()).unwrap_or(6);
         let mut prev_have=0usize;
-        for attempt in 1..=3 {
+        for attempt in 1..=5 {
             let have=db.get_deck("live_deck").map(|d|d.slides.len()).unwrap_or(0);
             let nophoto:Vec<usize>=db.get_deck("live_deck").map(|d|photoless_slides(&d)).unwrap_or_default();
             if have==want&&nophoto.is_empty(){break;}
             if attempt>1&&have==prev_have{eprintln!("[live] no progress (kemungkinan 429); backoff 90 detik sebelum attempt {attempt}");std::thread::sleep(std::time::Duration::from_secs(90));}
             prev_have=have;
             eprintln!("[live] deck has {have}/{want} slides; continuation attempt {attempt}");
-            if have>0{let content=if have>want{format!("Deck sekarang berisi {have} slide, padahal brief meminta PERSIS {want} slide. Gabungkan atau hapus slide yang paling lemah sampai tersisa PERSIS {want} slide; slide yang dipertahankan jangan diubah.")}else{format!("Lanjutkan deck yang sudah ada: baru {have} dari {want} slide; slide tanpa foto: {:?} (nomor mulai 0). Lengkapi slide sisanya dan pasang foto Commons di slide tanpa foto (kata kunci: nama spesifik subjek - untuk tokoh: nama lengkapnya atau nama+peristiwa, mis. \"Susi Pudjiastuti\" atau \"Susi Air\"; untuk objek/hidangan: namanya), tanpa mengulang yang sudah ada.",nophoto)};let m=ChatMessage{id:new_id("msg"),deck_id:"live_deck".into(),role:"user".into(),content,tool_calls:Vec::new(),tool_call_id:None,reasoning_content:String::new(),streaming:false,created_at:chrono::Utc::now().to_rfc3339()};let _=db.append_message(&m);}
+            if have>0{let content=if have>want{format!("Deck sekarang berisi {have} slide, padahal brief meminta PERSIS {want} slide. Gabungkan atau hapus slide yang paling lemah sampai tersisa PERSIS {want} slide; slide yang dipertahankan jangan diubah. Slide tanpa foto: {:?} (nomor mulai 0) - bila slide itu lolos trim, pasang foto Commons di sana.",nophoto)}else{format!("Lanjutkan deck yang sudah ada: baru {have} dari {want} slide; slide tanpa foto: {:?} (nomor mulai 0). Lengkapi slide sisanya dan pasang foto Commons di slide tanpa foto (kata kunci: nama spesifik subjek - untuk tokoh: nama lengkapnya atau nama+peristiwa, mis. \"Susi Pudjiastuti\" atau \"Susi Air\"; untuk objek/hidangan: namanya), tanpa mengulang yang sudah ada.",nophoto)};let m=ChatMessage{id:new_id("msg"),deck_id:"live_deck".into(),role:"user".into(),content,tool_calls:Vec::new(),tool_call_id:None,reasoning_content:String::new(),streaming:false,created_at:chrono::Utc::now().to_rfc3339()};let _=db.append_message(&m);}
             let hist=db.list_messages("live_deck");let (c2,_)=headless_channel(path.clone());
             run_agent(&db,&settings,"live_deck",hist,Vec::new(),std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),c2).await;
         }
         // Geometry feedback rounds, like the app's render bridge: measure in Chrome, pass error findings back.
         let outd0=std::env::var("LIVE_OUT").unwrap_or("/tmp/live-out".into());
         let mut prev_errors=usize::MAX;let mut stalls=0;
-        for round in 1..=4 {
+        for round in 1..=5 {
             let Some(deck)=db.get_deck("live_deck") else{break};
             std::fs::create_dir_all(&outd0).ok();
             for f in std::fs::read_dir(&outd0).into_iter().flatten().flatten(){let _=std::fs::remove_file(f.path());}
@@ -2377,7 +2377,7 @@ mod live_provider_tests_2 {
             let lines:Vec<String>=out.map(|o|String::from_utf8_lossy(&o.stdout).lines().map(|l|l.to_string()).collect()).unwrap_or_default();
             println!("[live] geometry round {round}: {} error findings", lines.len());
             if lines.is_empty(){break}
-            if lines.len()>=prev_errors{stalls+=1;if stalls>=2{println!("[live] geometry stalled (retry provider tanpa progres); berhenti dengan {} error residu",lines.len());break}println!("[live] geometry tanpa progres (kemungkinan 429); backoff 60 detik sebelum ronde berikutnya");std::thread::sleep(std::time::Duration::from_secs(60));}else{stalls=0}
+            if lines.len()>=prev_errors{stalls+=1;if stalls>=3{println!("[live] geometry stalled (retry provider tanpa progres); berhenti dengan {} error residu",lines.len());break}println!("[live] geometry tanpa progres (kemungkinan 429); backoff 60 detik sebelum ronde berikutnya");std::thread::sleep(std::time::Duration::from_secs(60));}else{stalls=0}
             prev_errors=lines.len();
             let msg2 = ChatMessage { id: new_id("msg"), deck_id: "live_deck".into(), role: "user".into(), content: "Perbaiki temuan geometri render ini pada slide yang disebut.".into(), tool_calls: Vec::new(), tool_call_id: None, reasoning_content: String::new(), streaming: false, created_at: chrono::Utc::now().to_rfc3339() };
             let _ = db.append_message(&msg2);
