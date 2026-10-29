@@ -870,6 +870,12 @@ pub fn deck_lint(deck:&crate::model::Deck,index:usize)->Vec<Issue>{
     let Some(slide)=deck.slides.get(index) else{return out};
     out.extend(credit_issues(&slide.html));
     out.extend(divider_issues(&slide.html));
+    {
+        let fp=|h:&str|->Vec<String>{let mut v=vec![];let mut rest=h;while let Some(p)=rest.find("src=\"data:image"){let s=&rest[p+5..];let e=s.find('"').unwrap_or(s.len());v.push(s[..e.min(240)].to_string());rest=&s[e.min(s.len())..];}v};
+        let mine=fp(&slide.html);
+        let others:Vec<String>=deck.slides.iter().enumerate().filter(|(i,s)|*i!=index&&!s.hidden).flat_map(|(_,s)|fp(&s.html)).collect();
+        if mine.iter().any(|m|others.iter().any(|o|o==m)){out.push(error("asset-reused","Foto yang sama persis dipakai di slide lain juga. Satu foto satu slide: ganti foto ini dengan foto Commons berbeda (search_commons), jangan pakai ulang aset yang sama."))}
+    }
     if let Some(sig)=photo_layout(&slide.html){
         let vis:Vec<&crate::model::Slide>=deck.slides.iter().take(index+1).filter(|s|!s.hidden).collect();
         if vis.len()>=3{let n=vis.len();if (n-3..n-1).all(|i|photo_layout(&vis[i].html).as_deref()==Some(sig.as_str())){out.push(error("layout-monotone",format!("3 slide berturut-turut memakai penempatan foto yang sama ({sig}). Ubah slide ini: pilih salah satu: (a) foto penuh kanvas + panel teks gelap di bawah, (b) kolom foto 45% tinggi penuh di kiri/kanan, (c) band foto atas 55% (bila yang lain bukan band), (d) foto inset miring 60% lebar di atas latar krem, (e) foto potong diagonal clip-path. Jangan ulangi struktur slide sebelumnya.")))}}
@@ -1017,3 +1023,11 @@ fn deck(htmls:&[&str])->crate::model::Deck{let sl:Vec<serde_json::Value>=htmls.i
 #[test]fn credit_rules(){let bad="<body><div style=\"font-size:12px\">Foto: Unknown author / Wikimedia</div><div>Foto: A / Wikimedia Foto: A / Wikimedia</div></body>";let r:Vec<String>=credit_issues(bad).into_iter().map(|i|i.rule).collect();assert!(r.contains(&"credit-tiny".to_string()));assert!(r.contains(&"credit-no-name".to_string()));assert!(r.contains(&"credit-duplicated-text".to_string()));assert!(credit_issues("<body><div style=\"font-size:18px\">Foto: Adilarmaya / Wikimedia (CC BY-SA 4.0)</div></body>").is_empty());}
 #[test]fn photo_sparse_warns_on_photoless_middle_slides(){let p="<body><img src=\"asset:x\"></body>";let n="<body><p>x</p></body>";let d=deck(&[p,n,n,n,n,n,n]);assert!(deck_lint(&d,3).iter().any(|i|i.rule=="photo-sparse"));assert!(!deck_lint(&d,0).iter().any(|i|i.rule=="photo-sparse"));assert!(!deck_lint(&d,6).iter().any(|i|i.rule=="photo-sparse"));}}
 
+
+#[cfg(test)]
+mod asset_reuse_tests{
+    use super::*;
+    fn deck_with(a:&str,b:&str)->crate::model::Deck{let sl:Vec<serde_json::Value>=[a,b].iter().enumerate().map(|(i,h)|serde_json::json!({"id":format!("s{i}"),"html":h})).collect();serde_json::from_value(serde_json::json!({"id":"d","aspect":"4:5","slides":sl})).unwrap()}
+    #[test]fn same_photo_two_slides_flagged(){let img="src=\"data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD1234567890abcdefghij\"";let d=deck_with(&format!("<img {img}>"),&format!("<p>x</p><img {img}>"));let iss=deck_lint(&d,1);assert!(iss.iter().any(|i|i.rule=="asset-reused"),"{iss:?}")}
+    #[test]fn different_photos_ok(){let d=deck_with("<img src=\"data:image/jpeg;base64,AAAA1111BBBB2222CCCC3333DDDD\">","<img src=\"data:image/png;base64,ZZZZ9999YYYY8888XXXX7777WWWW\">");let iss=deck_lint(&d,1);assert!(!iss.iter().any(|i|i.rule=="asset-reused"),"{iss:?}")}
+}
