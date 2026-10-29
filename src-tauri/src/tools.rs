@@ -1091,7 +1091,9 @@ async fn commons_credit(source:&str)->String{
         let a=clean_artist_name(&a);
         let lic=em.get("LicenseShortName").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_string();
         let cats=em.get("Categories").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_lowercase();
-        let medium=medium_from_categories(&cats);
+        let desc=em.get("ImageDescription").and_then(|x|x.get("value")).and_then(|x|x.as_str()).unwrap_or("").to_lowercase();
+        let tname=title.replace('_'," ").to_lowercase();
+        let medium=medium_from_categories(&format!("{cats} {tname} {}",desc.chars().take(200).collect::<String>()));
         if a.is_empty()||a.len()>80{return None;}
         Some(format!("{a}|{lic}|{medium}"))
     };
