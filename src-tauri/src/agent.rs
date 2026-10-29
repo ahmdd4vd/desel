@@ -2374,7 +2374,17 @@ mod live_provider_tests_2 {
             for (i,s) in deck.slides.iter().enumerate(){std::fs::write(format!("{outd0}/{i}.html"),&s.html).ok();}
             std::fs::write(format!("{outd0}/titles.json"),serde_json::to_string(&titles).unwrap()).ok();
             let out=std::process::Command::new("node").arg("/home/sandbox/w/scripts/geo-measure.mjs").arg(&outd0).current_dir("/home/sandbox/w").output().ok();
-            let lines:Vec<String>=out.map(|o|String::from_utf8_lossy(&o.stdout).lines().map(|l|l.to_string()).collect()).unwrap_or_default();
+            let mut lines:Vec<String>=out.map(|o|String::from_utf8_lossy(&o.stdout).lines().map(|l|l.to_string()).collect()).unwrap_or_default();
+            {
+                let (w2,h2)=crate::lint::canvas(&deck.aspect);
+                for (i,s) in deck.slides.iter().enumerate(){
+                    let mut iss=crate::lint::lint(&s.html,w2,h2);
+                    iss.extend(crate::lint::deck_lint(&deck,i));
+                    for is in iss.into_iter().filter(|x|matches!(x.severity,crate::lint::Severity::Error)){
+                        lines.push(format!("Slide {} (\"{}\"): {}",i+1,s.title,is.message));
+                    }
+                }
+            }
             println!("[live] geometry round {round}: {} error findings", lines.len());
             if lines.is_empty(){break}
             if lines.len()>=prev_errors{stalls+=1;if stalls>=3{println!("[live] geometry stalled (retry provider tanpa progres); berhenti dengan {} error residu",lines.len());break}println!("[live] geometry tanpa progres (kemungkinan 429); backoff 60 detik sebelum ronde berikutnya");std::thread::sleep(std::time::Duration::from_secs(60));}else{stalls=0}
