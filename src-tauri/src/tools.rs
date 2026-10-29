@@ -682,6 +682,10 @@ fn write_slide_inner(ctx: &ToolContext<'_>, args: &Value) -> ToolOutcome {
         let h=&deck.slides[inserted_at].html;let low=h.to_lowercase();
         let has_photo=low.contains("<img")&&low.contains("src=\"data:image");
         let commons=ctx.db.list_assets(&ctx.deck_id).iter().any(|a|a.provenance.as_ref().map_or(false,|p|p.source_url.contains("commons.wikimedia.org")));
+        if let Some(cap)=regex::Regex::new(r"(?i)(?:foto|lukisan|litografi|gravir|ilustrasi|peta|gambar|poster)\s*:\s*([^/<(\n]{3,60})").ok().and_then(|r|r.captures(h).map(|c|c.get(2).map(|m|m.as_str().trim().to_lowercase())).flatten()){
+            let creators:Vec<String>=ctx.db.list_assets(&ctx.deck_id).iter().filter_map(|a|a.provenance.as_ref().map(|p2|p2.creator.to_lowercase())).filter(|c|!c.is_empty()).collect();
+            if !creators.is_empty()&&!creators.iter().any(|c|cap.contains(c.as_str())||c.contains(cap.as_str())){issues.push(crate::lint::Issue{rule:"credit-fabricated".into(),severity:crate::lint::Severity::Error,message:format!("Kredit \"{cap}\" tidak cocok dengan fotografer terverifikasi dari foto yang diimpor ({}). Pakai persis baris KREDIT TERVERIFIKASI dari hasil impor; bila foto itu tidak punya nama terverifikasi, ganti fotonya lewat search_commons. Kredit karangan = atribusi palsu.",creators.join(", ")).into()})}
+        }
         if has_photo&&commons&&!low.contains("foto:"){issues.push(crate::lint::Issue{rule:"photo-no-credit".into(),severity:crate::lint::Severity::Error,message:"Slide ini memakai foto Commons tapi tanpa kredit. Tambahkan satu baris kecil (>=18px, satu baris, >=24px dari tepi) persis dari baris KREDIT TERVERIFIKASI foto itu, mis. \"Foto: Nama / Wikimedia (lisensi)\". Bila foto itu tidak punya nama fotografer terverifikasi, GANTI fotonya lewat search_commons (jangan hapus kredit dan pakai foto tanpa atribusi).".into()})}
     }
     let review = if issues.is_empty() {
